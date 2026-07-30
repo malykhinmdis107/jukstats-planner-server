@@ -1,6 +1,6 @@
 // ============================================================
 // JUKSTATS PLANNER SERVER - Единый файл
-// Версия: 1.0.0
+// Адаптирован для Clever Cloud
 // ============================================================
 
 'use strict';
@@ -15,7 +15,7 @@ const { WebSocketServer } = require('ws');
 const admin = require('firebase-admin');
 
 // ============================ ПРОВЕРКА .ENV ============================
-const PORT = process.env.PORT || 4000;
+const PORT = process.env.PORT || 8080; // Clever Cloud использует 8080 по умолчанию
 const JWT_SECRET = process.env.JWT_SECRET;
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || '*';
 const LESTA_APP_ID = process.env.LESTA_APP_ID || '0d89e594d5374a4eec6f3a671c80ed52';
@@ -44,6 +44,7 @@ if (process.env.FIREBASE_CRED_JSON) {
   }
 } else {
   console.error('❌ Ошибка: Нет FIREBASE_CRED_JSON или FIREBASE_CRED_FILE в .env');
+  console.log('📌 Для Clever Cloud используйте переменную FIREBASE_CRED_JSON');
   process.exit(1);
 }
 
