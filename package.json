@@ -5,7 +5,11 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "postinstall": "echo '✅ JUKSTATS Planner Server установлен'"
+  },
+  "engines": {
+    "node": ">=18.x"
   },
   "dependencies": {
     "cors": "^2.8.5",
