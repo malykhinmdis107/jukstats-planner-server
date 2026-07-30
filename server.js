@@ -1,6 +1,6 @@
 // ============================================================
 // JUKSTATS PLANNER SERVER - Единый файл
-// Адаптирован для Clever Cloud
+// Адаптирован для Clever Cloud с вашими переменными
 // ============================================================
 
 'use strict';
@@ -15,7 +15,7 @@ const { WebSocketServer } = require('ws');
 const admin = require('firebase-admin');
 
 // ============================ ПРОВЕРКА .ENV ============================
-const PORT = process.env.PORT || 8080; // Clever Cloud использует 8080 по умолчанию
+const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET;
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || '*';
 const LESTA_APP_ID = process.env.LESTA_APP_ID || '0d89e594d5374a4eec6f3a671c80ed52';
@@ -27,33 +27,85 @@ if (!JWT_SECRET) {
 }
 
 // ============================ FIREBASE INIT ============================
+// Поддерживаем несколько способов загрузки Firebase ключей
 let firebaseCred = null;
-if (process.env.FIREBASE_CRED_JSON) {
+
+// Способ 1: FIREBASE_SERVICE_ACCOUNT (полный JSON сервисного аккаунта)
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  try {
+    firebaseCred = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    console.log('✅ Загружено из FIREBASE_SERVICE_ACCOUNT');
+  } catch (e) {
+    console.error('❌ Ошибка парсинга FIREBASE_SERVICE_ACCOUNT:', e.message);
+  }
+}
+
+// Способ 2: FIREBASE_CRED_JSON (альтернативное имя)
+if (!firebaseCred && process.env.FIREBASE_CRED_JSON) {
   try {
     firebaseCred = JSON.parse(process.env.FIREBASE_CRED_JSON);
+    console.log('✅ Загружено из FIREBASE_CRED_JSON');
   } catch (e) {
     console.error('❌ Ошибка парсинга FIREBASE_CRED_JSON:', e.message);
-    process.exit(1);
   }
-} else if (process.env.FIREBASE_CRED_FILE) {
+}
+
+// Способ 3: FIREBASE_PRIVATE_KEY + FIREBASE_CLIENT_EMAIL (раздельные переменные)
+if (!firebaseCred && process.env.FIREBASE_PRIVATE_KEY && process.env.FIREBASE_CLIENT_EMAIL) {
+  try {
+    const privateKey = process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n');
+    firebaseCred = {
+      type: 'service_account',
+      project_id: process.env.FIREBASE_PROJECT_ID || 'juk-stats',
+      private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID || '',
+      private_key: privateKey,
+      client_email: process.env.FIREBASE_CLIENT_EMAIL,
+      client_id: process.env.FIREBASE_CLIENT_ID || '',
+      auth_uri: 'https://accounts.google.com/o/oauth2/auth',
+      token_uri: 'https://oauth2.googleapis.com/token',
+      auth_provider_x509_cert_url: 'https://www.googleapis.com/oauth2/v1/certs',
+      client_x509_cert_url: `https://www.googleapis.com/robot/v1/metadata/x509/${encodeURIComponent(process.env.FIREBASE_CLIENT_EMAIL)}`,
+      universe_domain: 'googleapis.com'
+    };
+    console.log('✅ Собрано из FIREBASE_PRIVATE_KEY + FIREBASE_CLIENT_EMAIL');
+  } catch (e) {
+    console.error('❌ Ошибка сборки Firebase ключей:', e.message);
+  }
+}
+
+// Способ 4: FIREBASE_CRED_FILE (файл)
+if (!firebaseCred && process.env.FIREBASE_CRED_FILE) {
   try {
     firebaseCred = require(process.env.FIREBASE_CRED_FILE);
+    console.log('✅ Загружено из FIREBASE_CRED_FILE');
   } catch (e) {
     console.error('❌ Ошибка загрузки FIREBASE_CRED_FILE:', e.message);
-    process.exit(1);
   }
-} else {
-  console.error('❌ Ошибка: Нет FIREBASE_CRED_JSON или FIREBASE_CRED_FILE в .env');
-  console.log('📌 Для Clever Cloud используйте переменную FIREBASE_CRED_JSON');
+}
+
+if (!firebaseCred) {
+  console.error('❌ Ошибка: Не удалось загрузить Firebase credentials');
+  console.log('📌 Поддерживаемые переменные:');
+  console.log('   - FIREBASE_SERVICE_ACCOUNT (полный JSON)');
+  console.log('   - FIREBASE_CRED_JSON (полный JSON)');
+  console.log('   - FIREBASE_PRIVATE_KEY + FIREBASE_CLIENT_EMAIL');
   process.exit(1);
 }
 
+// Инициализация Firebase Admin
 if (!admin.apps.length) {
-  admin.initializeApp({ credential: admin.credential.cert(firebaseCred) });
+  try {
+    admin.initializeApp({ credential: admin.credential.cert(firebaseCred) });
+    console.log('✅ Firebase Admin инициализирован');
+  } catch (e) {
+    console.error('❌ Ошибка инициализации Firebase:', e.message);
+    process.exit(1);
+  }
 }
 
 const db = admin.firestore();
 db.settings({ ignoreUndefinedProperties: true });
+console.log('✅ Firestore подключен');
 
 // ============================ КОНСТАНТЫ ============================
 const COL = {
@@ -487,4 +539,5 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`📡 REST API: http://localhost:${PORT}/api`);
   console.log(`🔌 WebSocket: ws://localhost:${PORT}/ws`);
   console.log(`❤️ Health: http://localhost:${PORT}/health`);
+  console.log(`🔥 Firebase проект: ${firebaseCred.project_id || 'unknown'}`);
 });
