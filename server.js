@@ -6,8 +6,6 @@ const admin = require('firebase-admin');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const fs = require('fs');
-
-// В начало server.js добавьте:
 const http = require('http');
 const { Server } = require('socket.io');
 
@@ -17,13 +15,6 @@ const io = new Server(server, {
         origin: '*',
         methods: ['GET', 'POST']
     }
-});
-
-// Замените app.listen на:
-server.listen(PORT, () => {
-    console.log(`🚀 Сервер запущен на порту ${PORT}`);
-    console.log(`📦 Firebase проект: ${serviceAccount.project_id}`);
-    console.log(`🔌 WebSocket готов`);
 });
 
 // ===== WEB SOCKET ДЛЯ REAL-TIME =====
@@ -657,8 +648,8 @@ app.use((err, req, res, next) => {
 
 // Запуск сервера
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 Сервер запущен на порту ${PORT}`);
-  console.log(`📦 Firebase проект: ${serviceAccount.project_id}`);
-  console.log(`🌐 http://localhost:${PORT}/briefings.html`);
+server.listen(PORT, () => {
+    console.log(`🚀 Сервер запущен на порту ${PORT}`);
+    console.log(`📦 Firebase проект: ${serviceAccount.project_id}`);
+    console.log(`🔌 WebSocket готов`);
 });
