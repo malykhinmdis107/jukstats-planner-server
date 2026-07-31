@@ -1,543 +1,486 @@
-// ============================================================
-// JUKSTATS PLANNER SERVER - Единый файл
-// Адаптирован для Clever Cloud с вашими переменными
-// ============================================================
-
-'use strict';
-
-// ============================ ЗАВИСИМОСТИ ============================
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const http = require('http');
-const jwt = require('jsonwebtoken');
-const { WebSocketServer } = require('ws');
+const helmet = require('helmet');
 const admin = require('firebase-admin');
-
-// ============================ ПРОВЕРКА .ENV ============================
-const PORT = process.env.PORT || 8080;
-const JWT_SECRET = process.env.JWT_SECRET;
-const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || '*';
-const LESTA_APP_ID = process.env.LESTA_APP_ID || '0d89e594d5374a4eec6f3a671c80ed52';
-const LESTA_API_BASE = process.env.LESTA_API_BASE || 'https://papi.tanksblitz.ru/wotb';
-
-if (!JWT_SECRET) {
-  console.error('❌ Ошибка: JWT_SECRET не задан в .env');
-  process.exit(1);
-}
-
-// ============================ FIREBASE INIT ============================
-// Поддерживаем несколько способов загрузки Firebase ключей
-let firebaseCred = null;
-
-// Способ 1: FIREBASE_SERVICE_ACCOUNT (полный JSON сервисного аккаунта)
-if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-  try {
-    firebaseCred = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-    console.log('✅ Загружено из FIREBASE_SERVICE_ACCOUNT');
-  } catch (e) {
-    console.error('❌ Ошибка парсинга FIREBASE_SERVICE_ACCOUNT:', e.message);
-  }
-}
-
-// Способ 2: FIREBASE_CRED_JSON (альтернативное имя)
-if (!firebaseCred && process.env.FIREBASE_CRED_JSON) {
-  try {
-    firebaseCred = JSON.parse(process.env.FIREBASE_CRED_JSON);
-    console.log('✅ Загружено из FIREBASE_CRED_JSON');
-  } catch (e) {
-    console.error('❌ Ошибка парсинга FIREBASE_CRED_JSON:', e.message);
-  }
-}
-
-// Способ 3: FIREBASE_PRIVATE_KEY + FIREBASE_CLIENT_EMAIL (раздельные переменные)
-if (!firebaseCred && process.env.FIREBASE_PRIVATE_KEY && process.env.FIREBASE_CLIENT_EMAIL) {
-  try {
-    const privateKey = process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n');
-    firebaseCred = {
-      type: 'service_account',
-      project_id: process.env.FIREBASE_PROJECT_ID || 'juk-stats',
-      private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID || '',
-      private_key: privateKey,
-      client_email: process.env.FIREBASE_CLIENT_EMAIL,
-      client_id: process.env.FIREBASE_CLIENT_ID || '',
-      auth_uri: 'https://accounts.google.com/o/oauth2/auth',
-      token_uri: 'https://oauth2.googleapis.com/token',
-      auth_provider_x509_cert_url: 'https://www.googleapis.com/oauth2/v1/certs',
-      client_x509_cert_url: `https://www.googleapis.com/robot/v1/metadata/x509/${encodeURIComponent(process.env.FIREBASE_CLIENT_EMAIL)}`,
-      universe_domain: 'googleapis.com'
-    };
-    console.log('✅ Собрано из FIREBASE_PRIVATE_KEY + FIREBASE_CLIENT_EMAIL');
-  } catch (e) {
-    console.error('❌ Ошибка сборки Firebase ключей:', e.message);
-  }
-}
-
-// Способ 4: FIREBASE_CRED_FILE (файл)
-if (!firebaseCred && process.env.FIREBASE_CRED_FILE) {
-  try {
-    firebaseCred = require(process.env.FIREBASE_CRED_FILE);
-    console.log('✅ Загружено из FIREBASE_CRED_FILE');
-  } catch (e) {
-    console.error('❌ Ошибка загрузки FIREBASE_CRED_FILE:', e.message);
-  }
-}
-
-if (!firebaseCred) {
-  console.error('❌ Ошибка: Не удалось загрузить Firebase credentials');
-  console.log('📌 Поддерживаемые переменные:');
-  console.log('   - FIREBASE_SERVICE_ACCOUNT (полный JSON)');
-  console.log('   - FIREBASE_CRED_JSON (полный JSON)');
-  console.log('   - FIREBASE_PRIVATE_KEY + FIREBASE_CLIENT_EMAIL');
-  process.exit(1);
-}
+const { v4: uuidv4 } = require('uuid');
+const path = require('path');
 
 // Инициализация Firebase Admin
-if (!admin.apps.length) {
-  try {
-    admin.initializeApp({ credential: admin.credential.cert(firebaseCred) });
-    console.log('✅ Firebase Admin инициализирован');
-  } catch (e) {
-    console.error('❌ Ошибка инициализации Firebase:', e.message);
-    process.exit(1);
-  }
-}
-
-const db = admin.firestore();
-db.settings({ ignoreUndefinedProperties: true });
-console.log('✅ Firestore подключен');
-
-// ============================ КОНСТАНТЫ ============================
-const COL = {
-  USERS: 'users',
-  MEMBERS: 'members',
-  BRIEFINGS: 'briefings',
-  SLIDES: 'slides',
-  ENTITIES: 'entities',
+const serviceAccount = {
+  projectId: process.env.FIREBASE_PROJECT_ID,
+  clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+  privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n')
 };
 
-const FV = admin.firestore.FieldValue;
-const TOKEN_TTL = '14d';
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+  databaseURL: process.env.FIREBASE_DATABASE_URL
+});
 
-// ============================ AUTH HELPER ============================
-function signToken(user) {
-  return jwt.sign(
-    { id: user.id, name: user.name, isGuest: !!user.isGuest },
-    JWT_SECRET,
-    { expiresIn: TOKEN_TTL }
-  );
-}
-
-function verifyToken(token) {
-  return jwt.verify(token, JWT_SECRET);
-}
-
-function requireAuth(req, res, next) {
-  const h = req.headers.authorization || '';
-  const token = h.startsWith('Bearer ') ? h.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'no_token' });
-  try {
-    req.user = verifyToken(token);
-    next();
-  } catch (e) {
-    return res.status(401).json({ error: 'bad_token' });
-  }
-}
-
-async function validateLesta(accessToken, accountId) {
-  const url = `${LESTA_API_BASE}/account/info/?application_id=${LESTA_APP_ID}&account_id=${accountId}&access_token=${encodeURIComponent(accessToken)}&fields=nickname`;
-  const r = await fetch(url);
-  const data = await r.json();
-  if (data && data.status === 'ok' && data.data && data.data[String(accountId)]) {
-    return data.data[String(accountId)];
-  }
-  return null;
-}
-
-async function upsertUser(id, name, isGuest) {
-  const ref = db.collection(COL.USERS).doc(String(id));
-  const snap = await ref.get();
-  const now = admin.firestore.FieldValue.serverTimestamp();
-  if (!snap.exists) {
-    await ref.set({ id: String(id), name: name || String(id), isGuest: !!isGuest, createdAt: now, updatedAt: now });
-  } else {
-    await ref.update({ name: name || snap.get('name'), isGuest: !!isGuest, updatedAt: now });
-  }
-  const fresh = await ref.get();
-  return fresh.data();
-}
-
-async function getBriefing(briefingId) {
-  const s = await db.collection(COL.BRIEFINGS).doc(briefingId).get();
-  return s.exists ? s.data() : null;
-}
-
-async function getMember(briefingId, userId) {
-  const s = await db.collection(COL.MEMBERS).doc(`${briefingId}__${userId}`).get();
-  return s.exists ? s.data() : null;
-}
-
-async function getRole(briefingId, userId) {
-  const b = await getBriefing(briefingId);
-  if (!b) return null;
-  if (String(b.ownerId) === String(userId)) return 'owner';
-  const m = await getMember(briefingId, userId);
-  return m ? m.role : null;
-}
-
-function canEditRole(role) { return role === 'owner' || role === 'editor'; }
-
-async function slideBriefing(slideId) {
-  const s = await db.collection(COL.SLIDES).doc(slideId).get();
-  return s.exists ? s.data() : null;
-}
-
-async function guardEdit(slideId, userId) {
-  const sl = await slideBriefing(slideId);
-  if (!sl) return { code: 404 };
-  const role = await getRole(sl.briefingId, userId);
-  if (!canEditRole(role)) return { code: 403 };
-  return { code: 200, sl };
-}
-
-// ============================ EXPRESS APP ============================
+const db = admin.firestore();
 const app = express();
-app.use(cors({
-  origin: CLIENT_ORIGIN,
-  methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+
+// Middleware
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginEmbedderPolicy: false
 }));
-app.use(express.json({ limit: '4mb' }));
+app.use(cors({
+  origin: process.env.CLIENT_URL || '*',
+  credentials: true
+}));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.static(path.join(__dirname, 'public')));
 
-// ============================ HEALTH ============================
-app.get('/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
+// Middleware для проверки авторизации
+const authMiddleware = async (req, res, next) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) {
+    return res.status(401).json({ error: 'Требуется авторизация' });
+  }
+  
+  try {
+    const decodedToken = await admin.auth().verifyIdToken(token);
+    req.user = decodedToken;
+    next();
+  } catch (error) {
+    // Для гостевых пользователей
+    try {
+      const userDoc = await db.collection('users').doc(token).get();
+      if (userDoc.exists) {
+        req.user = { uid: token, ...userDoc.data() };
+        next();
+      } else {
+        res.status(401).json({ error: 'Пользователь не найден' });
+      }
+    } catch (e) {
+      res.status(401).json({ error: 'Неверный токен' });
+    }
+  }
+};
 
-// ============================ ROUTES ============================
+// ============ AUTH ROUTES ============
 
-// ---------- AUTH ----------
+// Lesta авторизация
 app.post('/api/auth/lesta', async (req, res) => {
   try {
-    const { accessToken, accountId, nickname } = req.body || {};
-    if (!accessToken || !accountId) return res.status(400).json({ error: 'missing_fields' });
-    const info = await validateLesta(accessToken, accountId);
-    if (!info) return res.status(401).json({ error: 'lesta_rejected' });
-    const name = nickname || (info && info.nickname) || ('Игрок_' + accountId);
-    const user = await upsertUser(accountId, name, false);
-    const token = signToken(user);
-    res.json({ token, user });
-  } catch (e) {
-    console.error('auth/lesta', e);
-    res.status(500).json({ error: 'server_error' });
+    const { accessToken, accountId, nickname } = req.body;
+    
+    if (!accessToken || !accountId) {
+      return res.status(400).json({ error: 'Неверные данные' });
+    }
+
+    // Создаем Firebase пользователя или получаем существующего
+    const firebaseUid = `lesta_${accountId}`;
+    
+    let userDoc = await db.collection('users').doc(firebaseUid).get();
+    
+    if (!userDoc.exists) {
+      await db.collection('users').doc(firebaseUid).set({
+        uid: firebaseUid,
+        lestaId: accountId,
+        name: nickname || 'Игрок',
+        avatar: null,
+        isGuest: false,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastLogin: admin.firestore.FieldValue.serverTimestamp()
+      });
+    } else {
+      await db.collection('users').doc(firebaseUid).update({
+        name: nickname || userDoc.data().name,
+        lastLogin: admin.firestore.FieldValue.serverTimestamp()
+      });
+    }
+
+    // Генерируем кастомный токен
+    const customToken = await admin.auth().createCustomToken(firebaseUid);
+    
+    res.json({
+      token: customToken,
+      user: {
+        id: firebaseUid,
+        name: nickname || 'Игрок',
+        lestaId: accountId,
+        isGuest: false
+      }
+    });
+  } catch (error) {
+    console.error('Lesta auth error:', error);
+    res.status(500).json({ error: 'Ошибка авторизации' });
   }
 });
 
+// Гостевая авторизация
 app.post('/api/auth/guest', async (req, res) => {
   try {
-    const { localId, name } = req.body || {};
-    if (!localId) return res.status(400).json({ error: 'missing_localId' });
-    const user = await upsertUser(localId, name || 'Гость', true);
-    const token = signToken(user);
-    res.json({ token, user });
-  } catch (e) {
-    console.error('auth/guest', e);
-    res.status(500).json({ error: 'server_error' });
-  }
-});
-
-app.get('/api/auth/me', requireAuth, async (req, res) => {
-  const s = await db.collection(COL.USERS).doc(String(req.user.id)).get();
-  res.json({ user: s.exists ? s.data() : { id: req.user.id, name: req.user.name, isGuest: req.user.isGuest } });
-});
-
-// ---------- USERS ----------
-app.get('/api/users/:id', requireAuth, async (req, res) => {
-  const s = await db.collection(COL.USERS).doc(String(req.params.id)).get();
-  if (!s.exists) return res.status(404).json({ error: 'not_found' });
-  res.json({ user: s.data() });
-});
-
-// ---------- BRIEFINGS ----------
-app.post('/api/briefings', requireAuth, async (req, res) => {
-  try {
-    const title = (req.body && req.body.title) || 'Безымянный брифинг';
-    const bRef = db.collection(COL.BRIEFINGS).doc();
-    const sRef = db.collection(COL.SLIDES).doc();
-    const mRef = db.collection(COL.MEMBERS).doc(`${bRef.id}__${req.user.id}`);
-    const now = FV.serverTimestamp();
-
-    await db.runTransaction(async tx => {
-      tx.set(bRef, { id: bRef.id, ownerId: String(req.user.id), title, notes: '', createdAt: now, updatedAt: now });
-      tx.set(mRef, { id: mRef.id, briefingId: bRef.id, userId: String(req.user.id), role: 'owner', joinedAt: now });
-      tx.set(sRef, { id: sRef.id, briefingId: bRef.id, name: 'Этап', mapId: 'molen', order: 0, createdAt: now });
-    });
-
-    res.json({ briefing: { id: bRef.id, ownerId: String(req.user.id), title, notes: '' }, slide: { id: sRef.id, name: 'Этап', mapId: 'molen', order: 0 } });
-  } catch (e) {
-    console.error('POST /briefings', e);
-    res.status(500).json({ error: 'server_error' });
-  }
-});
-
-app.get('/api/briefings/mine', requireAuth, async (req, res) => {
-  const snap = await db.collection(COL.BRIEFINGS).where('ownerId', '==', String(req.user.id)).get();
-  const list = [];
-  for (const d of snap.docs) {
-    const b = d.data();
-    const slides = await db.collection(COL.SLIDES).where('briefingId', '==', b.id).get();
-    const slideArr = slides.docs.map(x => x.data()).sort((a, c) => (a.order || 0) - (c.order || 0));
-    list.push({
-      id: b.id, title: b.title, notes: b.notes, updatedAt: b.updatedAt, createdAt: b.createdAt,
-      slideCount: slideArr.length,
-      firstMap: slideArr[0] ? slideArr[0].mapId : null,
-    });
-  }
-  res.json({ briefings: list });
-});
-
-app.get('/api/briefings/:id', requireAuth, async (req, res) => {
-  const role = await getRole(req.params.id, req.user.id);
-  if (!role) return res.status(403).json({ error: 'forbidden' });
-  const b = await getBriefing(req.params.id);
-
-  const mSnap = await db.collection(COL.MEMBERS).where('briefingId', '==', req.params.id).get();
-  const members = mSnap.docs.map(x => x.data());
-
-  const sSnap = await db.collection(COL.SLIDES).where('briefingId', '==', req.params.id).get();
-  const slides = sSnap.docs.map(x => x.data()).sort((a, c) => (a.order || 0) - (c.order || 0));
-
-  res.json({ briefing: b, members, slides, myRole: role });
-});
-
-app.patch('/api/briefings/:id', requireAuth, async (req, res) => {
-  const role = await getRole(req.params.id, req.user.id);
-  if (!canEditRole(role)) return res.status(403).json({ error: 'forbidden' });
-  const upd = { updatedAt: FV.serverTimestamp() };
-  if (typeof req.body.title === 'string') upd.title = req.body.title;
-  if (typeof req.body.notes === 'string') upd.notes = req.body.notes;
-  await db.collection(COL.BRIEFINGS).doc(req.params.id).update(upd);
-  res.json({ ok: true });
-});
-
-app.delete('/api/briefings/:id', requireAuth, async (req, res) => {
-  const role = await getRole(req.params.id, req.user.id);
-  if (role !== 'owner') return res.status(403).json({ error: 'forbidden' });
-  const bid = req.params.id;
-
-  const sSnap = await db.collection(COL.SLIDES).where('briefingId', '==', bid).get();
-  const slideIds = sSnap.docs.map(x => x.id);
-
-  await db.runTransaction(async tx => {
-    for (const sid of slideIds) {
-      const eSnap = await db.collection(COL.ENTITIES).where('slideId', '==', sid).get();
-      eSnap.docs.forEach(e => tx.delete(e.ref));
-      tx.delete(db.collection(COL.SLIDES).doc(sid));
+    const { guestId, name } = req.body;
+    
+    if (!guestId) {
+      return res.status(400).json({ error: 'Требуется ID гостя' });
     }
-    const mSnap = await db.collection(COL.MEMBERS).where('briefingId', '==', bid).get();
-    mSnap.docs.forEach(m => tx.delete(m.ref));
-    tx.delete(db.collection(COL.BRIEFINGS).doc(bid));
-  });
-  res.json({ ok: true });
-});
 
-app.post('/api/briefings/:id/join', requireAuth, async (req, res) => {
-  const b = await getBriefing(req.params.id);
-  if (!b) return res.status(404).json({ error: 'not_found' });
-  const mid = `${req.params.id}__${req.user.id}`;
-  const mRef = db.collection(COL.MEMBERS).doc(mid);
-  const existing = await mRef.get();
-  if (!existing.exists) {
-    await mRef.set({ id: mid, briefingId: req.params.id, userId: String(req.user.id), role: 'viewer', joinedAt: FV.serverTimestamp() });
+    const firebaseUid = `guest_${guestId}`;
+    
+    const userDoc = await db.collection('users').doc(firebaseUid).get();
+    
+    if (!userDoc.exists) {
+      await db.collection('users').doc(firebaseUid).set({
+        uid: firebaseUid,
+        guestId: guestId,
+        name: name || 'Гость',
+        isGuest: true,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastLogin: admin.firestore.FieldValue.serverTimestamp()
+      });
+    } else {
+      await db.collection('users').doc(firebaseUid).update({
+        lastLogin: admin.firestore.FieldValue.serverTimestamp()
+      });
+    }
+
+    const customToken = await admin.auth().createCustomToken(firebaseUid);
+    
+    res.json({
+      token: customToken,
+      user: {
+        id: firebaseUid,
+        name: name || 'Гость',
+        isGuest: true,
+        guestId: guestId
+      }
+    });
+  } catch (error) {
+    console.error('Guest auth error:', error);
+    res.status(500).json({ error: 'Ошибка авторизации' });
   }
-  const role = await getRole(req.params.id, req.user.id);
-  res.json({ ok: true, role });
 });
 
-app.post('/api/briefings/:id/members', requireAuth, async (req, res) => {
-  if ((await getRole(req.params.id, req.user.id)) !== 'owner') return res.status(403).json({ error: 'forbidden' });
-  const { userId, role } = req.body || {};
-  if (!userId || !['editor', 'viewer'].includes(role)) return res.status(400).json({ error: 'bad_params' });
-  if (String(userId) === String(req.user.id)) return res.status(400).json({ error: 'cant_change_self' });
-  const mid = `${req.params.id}__${userId}`;
-  await db.collection(COL.MEMBERS).doc(mid).set(
-    { id: mid, briefingId: req.params.id, userId: String(userId), role, joinedAt: FV.serverTimestamp() },
-    { merge: true }
-  );
-  res.json({ ok: true });
-});
-
-app.patch('/api/briefings/:id/members/:userId', requireAuth, async (req, res) => {
-  if ((await getRole(req.params.id, req.user.id)) !== 'owner') return res.status(403).json({ error: 'forbidden' });
-  const { role } = req.body || {};
-  if (!['editor', 'viewer'].includes(role)) return res.status(400).json({ error: 'bad_role' });
-  await db.collection(COL.MEMBERS).doc(`${req.params.id}__${req.params.userId}`).update({ role });
-  res.json({ ok: true });
-});
-
-app.delete('/api/briefings/:id/members/:userId', requireAuth, async (req, res) => {
-  if ((await getRole(req.params.id, req.user.id)) !== 'owner') return res.status(403).json({ error: 'forbidden' });
-  await db.collection(COL.MEMBERS).doc(`${req.params.id}__${req.params.userId}`).delete();
-  res.json({ ok: true });
-});
-
-// ---------- SLIDES ----------
-app.post('/api/briefings/:bid/slides', requireAuth, async (req, res) => {
-  const role = await getRole(req.params.bid, req.user.id);
-  if (!canEditRole(role)) return res.status(403).json({ error: 'forbidden' });
-
-  const { name, mapId } = req.body || {};
-  const orderSnap = await db.collection(COL.SLIDES).where('briefingId', '==', req.params.bid).get();
-  const order = orderSnap.docs.reduce((m, d) => Math.max(m, (d.data().order || 0) + 1), 0);
-
-  const ref = db.collection(COL.SLIDES).doc();
-  const slide = { id: ref.id, briefingId: req.params.bid, name: name || 'Этап', mapId: mapId || 'molen', order, createdAt: FV.serverTimestamp() };
-  await ref.set(slide);
-  res.json({ slide });
-});
-
-app.get('/api/slides/:sid/entities', requireAuth, async (req, res) => {
-  const sl = await slideBriefing(req.params.sid);
-  if (!sl) return res.status(404).json({ error: 'not_found' });
-  const role = await getRole(sl.briefingId, req.user.id);
-  if (!role) return res.status(403).json({ error: 'forbidden' });
-  const snap = await db.collection(COL.ENTITIES).where('slideId', '==', req.params.sid).get();
-  res.json({ entities: snap.docs.map(d => d.data()) });
-});
-
-app.patch('/api/slides/:sid', requireAuth, async (req, res) => {
-  const sl = await slideBriefing(req.params.sid);
-  if (!sl) return res.status(404).json({ error: 'not_found' });
-  if (!canEditRole(await getRole(sl.briefingId, req.user.id))) return res.status(403).json({ error: 'forbidden' });
-  const upd = {};
-  if (typeof req.body.name === 'string') upd.name = req.body.name;
-  if (typeof req.body.mapId === 'string') upd.mapId = req.body.mapId;
-  if (typeof req.body.order === 'number') upd.order = req.body.order;
-  if (Object.keys(upd).length) await db.collection(COL.SLIDES).doc(req.params.sid).update(upd);
-  res.json({ ok: true });
-});
-
-app.delete('/api/slides/:sid', requireAuth, async (req, res) => {
-  const sl = await slideBriefing(req.params.sid);
-  if (!sl) return res.status(404).json({ error: 'not_found' });
-  if (!canEditRole(await getRole(sl.briefingId, req.user.id))) return res.status(403).json({ error: 'forbidden' });
-  await db.runTransaction(async tx => {
-    const eSnap = await db.collection(COL.ENTITIES).where('slideId', '==', req.params.sid).get();
-    eSnap.docs.forEach(e => tx.delete(e.ref));
-    tx.delete(db.collection(COL.SLIDES).doc(req.params.sid));
-  });
-  res.json({ ok: true });
-});
-
-// ---------- ENTITIES ----------
-app.post('/api/slides/:sid/entities', requireAuth, async (req, res) => {
-  const g = await guardEdit(req.params.sid, req.user.id);
-  if (g.code !== 200) return res.status(g.code).json({ error: g.code === 404 ? 'not_found' : 'forbidden' });
-  const { type, data, id } = req.body || {};
-  if (!type) return res.status(400).json({ error: 'no_type' });
-  const ref = id ? db.collection(COL.ENTITIES).doc(String(id)) : db.collection(COL.ENTITIES).doc();
-  const entity = { id: ref.id, slideId: req.params.sid, type, data: data || {}, updatedAt: FV.serverTimestamp() };
-  await ref.set(entity, { merge: true });
-  res.json({ entity });
-});
-
-app.patch('/api/entities/:eid', requireAuth, async (req, res) => {
-  const eSnap = await db.collection(COL.ENTITIES).doc(req.params.eid).get();
-  if (!eSnap.exists) return res.status(404).json({ error: 'not_found' });
-  const g = await guardEdit(eSnap.get('slideId'), req.user.id);
-  if (g.code !== 200) return res.status(g.code).json({ error: 'forbidden' });
-  const upd = { updatedAt: FV.serverTimestamp() };
-  if (req.body.type) upd.type = req.body.type;
-  if (req.body.data) upd.data = req.body.data;
-  await eSnap.ref.update(upd);
-  res.json({ ok: true });
-});
-
-app.delete('/api/entities/:eid', requireAuth, async (req, res) => {
-  const eSnap = await db.collection(COL.ENTITIES).doc(req.params.eid).get();
-  if (!eSnap.exists) return res.status(404).json({ error: 'not_found' });
-  const g = await guardEdit(eSnap.get('slideId'), req.user.id);
-  if (g.code !== 200) return res.status(g.code).json({ error: 'forbidden' });
-  await eSnap.ref.delete();
-  res.json({ ok: true });
-});
-
-app.put('/api/slides/:sid/entities', requireAuth, async (req, res) => {
-  const g = await guardEdit(req.params.sid, req.user.id);
-  if (g.code !== 200) return res.status(g.code).json({ error: g.code === 404 ? 'not_found' : 'forbidden' });
-  const incoming = Array.isArray(req.body && req.body.entities) ? req.body.entities : [];
-  const sid = req.params.sid;
-
-  const existing = await db.collection(COL.ENTITIES).where('slideId', '==', sid).get();
-  const existingIds = new Set(existing.docs.map(d => d.id));
-  const incomingIds = new Set(incoming.map(e => e && e.id).filter(Boolean));
-
-  const batch = db.batch();
-  for (const e of incoming) {
-    if (!e || !e.id || !e.type) continue;
-    const ref = db.collection(COL.ENTITIES).doc(String(e.id));
-    const { id, type, slideId, updatedAt, createdAt, ...rest } = e;
-    batch.set(ref, { id: String(e.id), slideId: sid, type, data: rest, updatedAt: FV.serverTimestamp() }, { merge: true });
+// Проверка текущего пользователя
+app.get('/api/auth/me', authMiddleware, async (req, res) => {
+  try {
+    const userDoc = await db.collection('users').doc(req.user.uid).get();
+    
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+    
+    res.json({ user: userDoc.data() });
+  } catch (error) {
+    res.status(500).json({ error: 'Ошибка сервера' });
   }
-  for (const d of existing.docs) {
-    if (!incomingIds.has(d.id)) batch.delete(d.ref);
-  }
-  await batch.commit();
-  res.json({ ok: true, count: incoming.length });
 });
 
-// ============================ WEBSOCKET ============================
-const rooms = new Map();
+// ============ BRIEFINGS ROUTES ============
 
-function broadcast(room, msg, except) {
-  const set = rooms.get(room);
-  if (!set) return;
-  const data = JSON.stringify(msg);
-  for (const s of set) {
-    if (s === except) continue;
-    if (s.readyState === 1) s.send(data);
+// Создание брифинга
+app.post('/api/briefings', authMiddleware, async (req, res) => {
+  try {
+    const { title } = req.body;
+    const briefingId = uuidv4();
+    
+    const briefingData = {
+      id: briefingId,
+      title: title || 'Безымянный брифинг',
+      ownerId: req.user.uid,
+      editors: [],
+      viewers: [],
+      notes: '',
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+    
+    // Создаем брифинг
+    await db.collection('briefings').doc(briefingId).set(briefingData);
+    
+    // Создаем первый слайд
+    const slideId = uuidv4();
+    await db.collection('slides').doc(slideId).set({
+      id: slideId,
+      briefingId: briefingId,
+      name: 'Этап 1',
+      mapId: 'molen',
+      entities: [],
+      order: 0,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    
+    res.json({
+      briefing: briefingData,
+      firstSlideId: slideId
+    });
+  } catch (error) {
+    console.error('Create briefing error:', error);
+    res.status(500).json({ error: 'Ошибка создания брифинга' });
   }
+});
+
+// Получение брифингов пользователя
+app.get('/api/briefings', authMiddleware, async (req, res) => {
+  try {
+    const briefingsSnapshot = await db.collection('briefings')
+      .where('ownerId', '==', req.user.uid)
+      .orderBy('updatedAt', 'desc')
+      .get();
+    
+    const briefings = [];
+    for (const doc of briefingsSnapshot.docs) {
+      const briefing = doc.data();
+      
+      // Получаем количество слайдов
+      const slidesSnapshot = await db.collection('slides')
+        .where('briefingId', '==', briefing.id)
+        .get();
+      
+      // Получаем информацию о первой карте
+      const firstSlide = slidesSnapshot.docs[0]?.data();
+      
+      briefings.push({
+        ...briefing,
+        slideCount: slidesSnapshot.size,
+        firstMap: firstSlide ? getMapName(firstSlide.mapId) : '—'
+      });
+    }
+    
+    res.json({ briefings });
+  } catch (error) {
+    console.error('Get briefings error:', error);
+    res.status(500).json({ error: 'Ошибка получения брифингов' });
+  }
+});
+
+// Получение конкретного брифинга
+app.get('/api/briefings/:id', authMiddleware, async (req, res) => {
+  try {
+    const briefingDoc = await db.collection('briefings').doc(req.params.id).get();
+    
+    if (!briefingDoc.exists) {
+      return res.status(404).json({ error: 'Брифинг не найден' });
+    }
+    
+    const briefing = briefingDoc.data();
+    
+    // Проверяем права доступа
+    const isOwner = briefing.ownerId === req.user.uid;
+    const isEditor = briefing.editors.includes(req.user.uid);
+    const isViewer = briefing.viewers.includes(req.user.uid);
+    
+    if (!isOwner && !isEditor && !isViewer) {
+      return res.status(403).json({ error: 'Нет доступа к этому брифингу' });
+    }
+    
+    // Получаем слайды
+    const slidesSnapshot = await db.collection('slides')
+      .where('briefingId', '==', req.params.id)
+      .orderBy('order')
+      .get();
+    
+    const slides = slidesSnapshot.docs.map(doc => doc.data());
+    
+    res.json({
+      briefing,
+      slides,
+      myRole: isOwner ? 'owner' : isEditor ? 'editor' : 'viewer'
+    });
+  } catch (error) {
+    console.error('Get briefing error:', error);
+    res.status(500).json({ error: 'Ошибка получения брифинга' });
+  }
+});
+
+// Обновление брифинга
+app.put('/api/briefings/:id', authMiddleware, async (req, res) => {
+  try {
+    const briefingRef = db.collection('briefings').doc(req.params.id);
+    const briefingDoc = await briefingRef.get();
+    
+    if (!briefingDoc.exists) {
+      return res.status(404).json({ error: 'Брифинг не найден' });
+    }
+    
+    const briefing = briefingDoc.data();
+    
+    // Проверяем права на редактирование
+    if (briefing.ownerId !== req.user.uid && !briefing.editors.includes(req.user.uid)) {
+      return res.status(403).json({ error: 'Нет прав на редактирование' });
+    }
+    
+    await briefingRef.update({
+      ...req.body,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Update briefing error:', error);
+    res.status(500).json({ error: 'Ошибка обновления брифинга' });
+  }
+});
+
+// Удаление брифинга
+app.delete('/api/briefings/:id', authMiddleware, async (req, res) => {
+  try {
+    const briefingRef = db.collection('briefings').doc(req.params.id);
+    const briefingDoc = await briefingRef.get();
+    
+    if (!briefingDoc.exists) {
+      return res.status(404).json({ error: 'Брифинг не найден' });
+    }
+    
+    const briefing = briefingDoc.data();
+    
+    if (briefing.ownerId !== req.user.uid) {
+      return res.status(403).json({ error: 'Только владелец может удалить брифинг' });
+    }
+    
+    // Удаляем все связанные слайды
+    const slidesSnapshot = await db.collection('slides')
+      .where('briefingId', '==', req.params.id)
+      .get();
+    
+    const batch = db.batch();
+    slidesSnapshot.docs.forEach(doc => batch.delete(doc.ref));
+    batch.delete(briefingRef);
+    await batch.commit();
+    
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Delete briefing error:', error);
+    res.status(500).json({ error: 'Ошибка удаления брифинга' });
+  }
+});
+
+// ============ SLIDES ROUTES ============
+
+// Создание слайда
+app.post('/api/slides', authMiddleware, async (req, res) => {
+  try {
+    const { briefingId, name, mapId } = req.body;
+    
+    // Проверяем права на брифинг
+    const briefingDoc = await db.collection('briefings').doc(briefingId).get();
+    if (!briefingDoc.exists) {
+      return res.status(404).json({ error: 'Брифинг не найден' });
+    }
+    
+    const briefing = briefingDoc.data();
+    if (briefing.ownerId !== req.user.uid && !briefing.editors.includes(req.user.uid)) {
+      return res.status(403).json({ error: 'Нет прав на создание слайдов' });
+    }
+    
+    // Получаем максимальный order
+    const slidesSnapshot = await db.collection('slides')
+      .where('briefingId', '==', briefingId)
+      .orderBy('order', 'desc')
+      .limit(1)
+      .get();
+    
+    const maxOrder = slidesSnapshot.docs[0]?.data().order || -1;
+    
+    const slideId = uuidv4();
+    const slideData = {
+      id: slideId,
+      briefingId,
+      name: name || 'Этап',
+      mapId: mapId || 'molen',
+      entities: [],
+      order: maxOrder + 1,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+    
+    await db.collection('slides').doc(slideId).set(slideData);
+    
+    res.json({ slide: slideData });
+  } catch (error) {
+    console.error('Create slide error:', error);
+    res.status(500).json({ error: 'Ошибка создания слайда' });
+  }
+});
+
+// Обновление слайда
+app.put('/api/slides/:id', authMiddleware, async (req, res) => {
+  try {
+    const slideRef = db.collection('slides').doc(req.params.id);
+    const slideDoc = await slideRef.get();
+    
+    if (!slideDoc.exists) {
+      return res.status(404).json({ error: 'Слайд не найден' });
+    }
+    
+    // Проверяем права на брифинг
+    const slide = slideDoc.data();
+    const briefingDoc = await db.collection('briefings').doc(slide.briefingId).get();
+    const briefing = briefingDoc.data();
+    
+    if (briefing.ownerId !== req.user.uid && !briefing.editors.includes(req.user.uid)) {
+      return res.status(403).json({ error: 'Нет прав на редактирование' });
+    }
+    
+    await slideRef.update({
+      ...req.body,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Update slide error:', error);
+    res.status(500).json({ error: 'Ошибка обновления слайда' });
+  }
+});
+
+// Удаление слайда
+app.delete('/api/slides/:id', authMiddleware, async (req, res) => {
+  try {
+    const slideRef = db.collection('slides').doc(req.params.id);
+    const slideDoc = await slideRef.get();
+    
+    if (!slideDoc.exists) {
+      return res.status(404).json({ error: 'Слайд не найден' });
+    }
+    
+    const slide = slideDoc.data();
+    const briefingDoc = await db.collection('briefings').doc(slide.briefingId).get();
+    const briefing = briefingDoc.data();
+    
+    if (briefing.ownerId !== req.user.uid && !briefing.editors.includes(req.user.uid)) {
+      return res.status(403).json({ error: 'Нет прав на удаление' });
+    }
+    
+    await slideRef.delete();
+    
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Delete slide error:', error);
+    res.status(500).json({ error: 'Ошибка удаления слайда' });
+  }
+});
+
+// Вспомогательная функция для названий карт
+function getMapName(mapId) {
+  const maps = {
+    'molen': 'Молендейк',
+    'himmelsdorf': 'Химмельсдорф',
+    'malinovka': 'Малиновка',
+    'prohorovka': 'Прохоровка',
+    'mines': 'Рудники',
+    'castilla': 'Кастилья',
+    'canal': 'Канал',
+    'port': 'Порт'
+    // Добавьте остальные карты
+  };
+  return maps[mapId] || mapId;
 }
 
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/ws' });
-
-wss.on('connection', (ws, req) => {
-  const q = new URL(req.url, 'http://x').searchParams;
-  const token = q.get('token');
-  const room = q.get('room');
-  let user;
-  try { user = verifyToken(token); } catch (e) { return ws.close(4001, 'bad_token'); }
-  if (!room) return ws.close(4002, 'no_room');
-
-  getRole(room, user.id).then(role => {
-    if (!role) return ws.close(4003, 'forbidden');
-    ws.user = user;
-    ws.room = room;
-    ws.role = role;
-    if (!rooms.has(room)) rooms.set(room, new Set());
-    rooms.get(room).add(ws);
-
-    ws.on('message', raw => {
-      let msg;
-      try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
-      if (!msg || typeof msg.type !== 'string') return;
-      const mutating = ['state', 'setrole', 'rename', 'present', 'preslide'];
-      if (mutating.includes(msg.type) && !canEditRole(ws.role)) return;
-      msg.from = user.id;
-      broadcast(room, msg, ws);
-    });
-
-    ws.on('close', () => {
-      const set = rooms.get(room);
-      if (set) { set.delete(ws); if (!set.size) rooms.delete(room); }
-    });
-  }).catch(() => ws.close(4500, 'err'));
+// Основной роут
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// ============================ ЗАПУСК ============================
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`✅ JUKSTATS Planner Server запущен на :${PORT}`);
-  console.log(`📡 REST API: http://localhost:${PORT}/api`);
-  console.log(`🔌 WebSocket: ws://localhost:${PORT}/ws`);
-  console.log(`❤️ Health: http://localhost:${PORT}/health`);
-  console.log(`🔥 Firebase проект: ${firebaseCred.project_id || 'unknown'}`);
+// Запуск сервера
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Сервер запущен на порту ${PORT}`);
+  console.log(`Firebase проект: ${process.env.FIREBASE_PROJECT_ID}`);
 });
