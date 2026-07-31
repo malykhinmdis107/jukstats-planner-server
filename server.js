@@ -6,27 +6,31 @@ const admin = require('firebase-admin');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 
-// Инициализация Firebase Admin с service account
+// Инициализация Firebase
 let serviceAccount;
 try {
-  // Пытаемся загрузить из переменной окружения
   if (process.env.FIREBASE_SERVICE_ACCOUNT) {
     serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-    console.log('Firebase: используем переменную окружения');
+  } else if (process.env.FIREBASE_PRIVATE_KEY) {
+    serviceAccount = {
+      project_id: process.env.FIREBASE_PROJECT_ID || 'juk-stats',
+      client_email: process.env.FIREBASE_CLIENT_EMAIL,
+      private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n')
+    };
   } else {
-    // Загружаем из файла
     serviceAccount = require('./serviceAccountKey.json');
-    console.log('Firebase: используем файл serviceAccountKey.json');
   }
+  
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    databaseURL: `https://${serviceAccount.project_id}.firebaseio.com`
+  });
+  
+  console.log('✅ Firebase initialized for project:', serviceAccount.project_id);
 } catch (error) {
-  console.error('Ошибка загрузки service account:', error);
+  console.error('❌ Firebase init error:', error.message);
   process.exit(1);
 }
-
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-  databaseURL: `https://${serviceAccount.project_id}.firebaseio.com`
-});
 
 const db = admin.firestore();
 const app = express();
@@ -37,7 +41,6 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false
 }));
 
-// Разрешаем запросы с любого источника (для разработки)
 app.use(cors({
   origin: '*',
   credentials: true,
@@ -46,71 +49,67 @@ app.use(cors({
 }));
 
 app.use(express.json({ limit: '10mb' }));
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.urlencoded({ extended: true }));
 
-// Health check endpoint
+// Логирование запросов
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} ${req.method} ${req.path}`);
+  next();
+});
+
+// Health check
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     project: serviceAccount.project_id,
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
   });
 });
 
-// Проверка подключения к Firebase
+// Firebase test
 app.get('/api/firebase-test', async (req, res) => {
   try {
-    const testDoc = await db.collection('_test').doc('connection').get();
-    res.json({ 
-      connected: true, 
-      project: serviceAccount.project_id 
+    await db.collection('_test').doc('connection').set({
+      timestamp: admin.firestore.FieldValue.serverTimestamp()
     });
+    res.json({ connected: true, project: serviceAccount.project_id });
   } catch (error) {
-    res.status(500).json({ 
-      connected: false, 
-      error: error.message 
-    });
+    res.status(500).json({ connected: false, error: error.message });
   }
 });
 
-// Middleware для авторизации (упрощенная версия)
+// Auth middleware
 const authMiddleware = async (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
   
-  // Если нет токена, разрешаем как гостю
   if (!token) {
     req.user = { uid: 'guest_' + uuidv4(), isGuest: true };
     return next();
   }
   
   try {
-    // Пытаемся верифицировать как Firebase токен
+    // Проверяем Firebase токен
     const decodedToken = await admin.auth().verifyIdToken(token);
     req.user = decodedToken;
-    next();
   } catch (error) {
-    // Если не Firebase токен, ищем в нашей БД
-    try {
-      const userDoc = await db.collection('users').doc(token).get();
-      if (userDoc.exists) {
-        req.user = { uid: token, ...userDoc.data() };
-        next();
-      } else {
-        // Создаем гостя
-        req.user = { uid: token, isGuest: true };
-        next();
-      }
-    } catch (e) {
-      req.user = { uid: 'guest_' + uuidv4(), isGuest: true };
-      next();
+    // Ищем в нашей БД
+    const userDoc = await db.collection('users').doc(token).get();
+    if (userDoc.exists) {
+      req.user = { uid: token, ...userDoc.data() };
+    } else {
+      req.user = { uid: token, isGuest: true };
     }
   }
+  
+  next();
 };
 
 // ============ AUTH ROUTES ============
 
 app.post('/api/auth/lesta', async (req, res) => {
   try {
+    console.log('Lesta auth request:', req.body);
     const { accessToken, accountId, nickname } = req.body;
     
     if (!accessToken || !accountId) {
@@ -139,16 +138,13 @@ app.post('/api/auth/lesta', async (req, res) => {
       });
     }
 
-    // Генерируем токен
-    let customToken;
-    try {
-      customToken = await admin.auth().createCustomToken(firebaseUid);
-    } catch (e) {
-      customToken = firebaseUid; // fallback
-    }
+    // Генерируем простой токен
+    const token = firebaseUid;
+    
+    console.log('✅ Lesta auth success:', firebaseUid);
     
     res.json({
-      token: customToken,
+      token,
       user: {
         id: firebaseUid,
         name: nickname || 'Игрок',
@@ -157,7 +153,7 @@ app.post('/api/auth/lesta', async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Lesta auth error:', error);
+    console.error('❌ Lesta auth error:', error);
     res.status(500).json({ error: 'Ошибка авторизации: ' + error.message });
   }
 });
@@ -174,33 +170,28 @@ app.post('/api/auth/guest', async (req, res) => {
     const userRef = db.collection('users').doc(firebaseUid);
     const userDoc = await userRef.get();
     
-    const userData = {
-      uid: firebaseUid,
-      guestId: guestId,
-      name: name || 'Гость',
-      isGuest: true,
-      lastLogin: admin.firestore.FieldValue.serverTimestamp()
-    };
-    
     if (!userDoc.exists) {
-      userData.createdAt = admin.firestore.FieldValue.serverTimestamp();
-      await userRef.set(userData);
+      await userRef.set({
+        uid: firebaseUid,
+        guestId,
+        name: name || 'Гость',
+        isGuest: true,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastLogin: admin.firestore.FieldValue.serverTimestamp()
+      });
     } else {
       await userRef.update({
         lastLogin: admin.firestore.FieldValue.serverTimestamp()
       });
     }
 
-    // Токен - просто ID пользователя
-    const token = firebaseUid;
-    
     res.json({
-      token,
+      token: firebaseUid,
       user: {
         id: firebaseUid,
         name: name || 'Гость',
         isGuest: true,
-        guestId: guestId
+        guestId
       }
     });
   } catch (error) {
@@ -212,25 +203,16 @@ app.post('/api/auth/guest', async (req, res) => {
 app.get('/api/auth/me', authMiddleware, async (req, res) => {
   try {
     const userDoc = await db.collection('users').doc(req.user.uid).get();
-    
-    if (!userDoc.exists) {
-      return res.json({ 
-        user: { 
-          id: req.user.uid, 
-          name: 'Гость', 
-          isGuest: true 
-        } 
-      });
-    }
-    
-    res.json({ user: userDoc.data() });
+    res.json({ 
+      user: userDoc.exists ? userDoc.data() : {
+        id: req.user.uid,
+        name: 'Гость',
+        isGuest: true
+      }
+    });
   } catch (error) {
     res.json({ 
-      user: { 
-        id: req.user.uid, 
-        name: 'Гость', 
-        isGuest: true 
-      } 
+      user: { id: req.user.uid, name: 'Гость', isGuest: true } 
     });
   }
 });
@@ -268,7 +250,7 @@ app.post('/api/briefings', authMiddleware, async (req, res) => {
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
     
-    console.log(`Создан брифинг: ${briefingId} пользователем ${req.user.uid}`);
+    console.log('✅ Created briefing:', briefingId);
     
     res.json({
       briefing: briefingData,
@@ -282,33 +264,49 @@ app.post('/api/briefings', authMiddleware, async (req, res) => {
 
 app.get('/api/briefings', authMiddleware, async (req, res) => {
   try {
-    console.log(`Запрос брифингов от пользователя: ${req.user.uid}`);
+    console.log('Fetching briefings for:', req.user.uid);
     
     const briefingsSnapshot = await db.collection('briefings')
       .where('ownerId', '==', req.user.uid)
-      .orderBy('updatedAt', 'desc')
       .get();
     
-    const briefings = [];
-    for (const doc of briefingsSnapshot.docs) {
-      const briefing = doc.data();
-      
-      const slidesSnapshot = await db.collection('slides')
-        .where('briefingId', '==', briefing.id)
-        .get();
-      
-      const firstSlide = slidesSnapshot.docs[0]?.data();
-      
-      briefings.push({
-        ...briefing,
-        slideCount: slidesSnapshot.size,
-        firstMap: getMapName(firstSlide?.mapId)
-      });
+    if (briefingsSnapshot.empty) {
+      return res.json({ briefings: [] });
     }
     
-    console.log(`Найдено брифингов: ${briefings.length}`);
+    const briefings = briefingsSnapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data()
+    }));
     
-    res.json({ briefings });
+    // Получаем слайды для каждого брифинга
+    const slidesPromises = briefings.map(b => 
+      db.collection('slides')
+        .where('briefingId', '==', b.id)
+        .get()
+    );
+    
+    const slidesSnapshots = await Promise.all(slidesPromises);
+    
+    const result = briefings.map((briefing, i) => {
+      const slides = slidesSnapshots[i].docs.map(doc => doc.data());
+      return {
+        ...briefing,
+        slideCount: slides.length,
+        firstMap: getMapName(slides[0]?.mapId)
+      };
+    });
+    
+    // Сортируем вручную
+    result.sort((a, b) => {
+      const dateA = a.updatedAt?.toDate?.() || new Date(0);
+      const dateB = b.updatedAt?.toDate?.() || new Date(0);
+      return dateB - dateA;
+    });
+    
+    console.log('✅ Found briefings:', result.length);
+    
+    res.json({ briefings: result });
   } catch (error) {
     console.error('Get briefings error:', error);
     res.status(500).json({ error: 'Ошибка получения брифингов: ' + error.message });
@@ -317,8 +315,6 @@ app.get('/api/briefings', authMiddleware, async (req, res) => {
 
 app.get('/api/briefings/:id', authMiddleware, async (req, res) => {
   try {
-    console.log(`Запрос брифинга: ${req.params.id}`);
-    
     const briefingDoc = await db.collection('briefings').doc(req.params.id).get();
     
     if (!briefingDoc.exists) {
@@ -329,21 +325,19 @@ app.get('/api/briefings/:id', authMiddleware, async (req, res) => {
     
     const slidesSnapshot = await db.collection('slides')
       .where('briefingId', '==', req.params.id)
-      .orderBy('order')
       .get();
     
-    const slides = slidesSnapshot.docs.map(doc => doc.data());
+    const slides = [];
+    slidesSnapshot.forEach(doc => slides.push(doc.data()));
+    slides.sort((a, b) => (a.order || 0) - (b.order || 0));
     
     const isOwner = briefing.ownerId === req.user.uid;
     const isEditor = briefing.editors?.includes(req.user.uid);
-    const myRole = isOwner ? 'owner' : isEditor ? 'editor' : 'viewer';
-    
-    console.log(`Брифинг загружен, слайдов: ${slides.length}, роль: ${myRole}`);
     
     res.json({
       briefing,
       slides,
-      myRole
+      myRole: isOwner ? 'owner' : isEditor ? 'editor' : 'viewer'
     });
   } catch (error) {
     console.error('Get briefing error:', error);
@@ -353,24 +347,10 @@ app.get('/api/briefings/:id', authMiddleware, async (req, res) => {
 
 app.put('/api/briefings/:id', authMiddleware, async (req, res) => {
   try {
-    const briefingRef = db.collection('briefings').doc(req.params.id);
-    const briefingDoc = await briefingRef.get();
-    
-    if (!briefingDoc.exists) {
-      return res.status(404).json({ error: 'Брифинг не найден' });
-    }
-    
-    const briefing = briefingDoc.data();
-    
-    if (briefing.ownerId !== req.user.uid && !briefing.editors?.includes(req.user.uid)) {
-      return res.status(403).json({ error: 'Нет прав на редактирование' });
-    }
-    
-    await briefingRef.update({
+    await db.collection('briefings').doc(req.params.id).update({
       ...req.body,
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
-    
     res.json({ success: true });
   } catch (error) {
     console.error('Update briefing error:', error);
@@ -387,12 +367,7 @@ app.delete('/api/briefings/:id', authMiddleware, async (req, res) => {
       return res.status(404).json({ error: 'Брифинг не найден' });
     }
     
-    const briefing = briefingDoc.data();
-    
-    if (briefing.ownerId !== req.user.uid) {
-      return res.status(403).json({ error: 'Только владелец может удалить брифинг' });
-    }
-    
+    // Удаляем слайды
     const slidesSnapshot = await db.collection('slides')
       .where('briefingId', '==', req.params.id)
       .get();
@@ -402,7 +377,7 @@ app.delete('/api/briefings/:id', authMiddleware, async (req, res) => {
     batch.delete(briefingRef);
     await batch.commit();
     
-    console.log(`Брифинг удален: ${req.params.id}`);
+    console.log('✅ Deleted briefing:', req.params.id);
     
     res.json({ success: true });
   } catch (error) {
@@ -417,36 +392,23 @@ app.post('/api/slides', authMiddleware, async (req, res) => {
   try {
     const { briefingId, name, mapId } = req.body;
     
-    const briefingDoc = await db.collection('briefings').doc(briefingId).get();
-    if (!briefingDoc.exists) {
-      return res.status(404).json({ error: 'Брифинг не найден' });
-    }
-    
     const slidesSnapshot = await db.collection('slides')
       .where('briefingId', '==', briefingId)
-      .orderBy('order', 'desc')
-      .limit(1)
       .get();
     
-    const maxOrder = slidesSnapshot.docs[0]?.data().order ?? -1;
-    
     const slideId = uuidv4();
-    const slideData = {
+    await db.collection('slides').doc(slideId).set({
       id: slideId,
       briefingId,
       name: name || 'Этап',
       mapId: mapId || 'molen',
       entities: [],
-      order: maxOrder + 1,
+      order: slidesSnapshot.size,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
-    };
+    });
     
-    await db.collection('slides').doc(slideId).set(slideData);
-    
-    console.log(`Создан слайд: ${slideId} для брифинга: ${briefingId}`);
-    
-    res.json({ slide: slideData });
+    res.json({ slide: { id: slideId, briefingId, name, mapId } });
   } catch (error) {
     console.error('Create slide error:', error);
     res.status(500).json({ error: 'Ошибка создания слайда: ' + error.message });
@@ -455,18 +417,10 @@ app.post('/api/slides', authMiddleware, async (req, res) => {
 
 app.put('/api/slides/:id', authMiddleware, async (req, res) => {
   try {
-    const slideRef = db.collection('slides').doc(req.params.id);
-    const slideDoc = await slideRef.get();
-    
-    if (!slideDoc.exists) {
-      return res.status(404).json({ error: 'Слайд не найден' });
-    }
-    
-    await slideRef.update({
+    await db.collection('slides').doc(req.params.id).update({
       ...req.body,
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
-    
     res.json({ success: true });
   } catch (error) {
     console.error('Update slide error:', error);
@@ -476,73 +430,41 @@ app.put('/api/slides/:id', authMiddleware, async (req, res) => {
 
 app.delete('/api/slides/:id', authMiddleware, async (req, res) => {
   try {
-    const slideRef = db.collection('slides').doc(req.params.id);
-    const slideDoc = await slideRef.get();
-    
-    if (!slideDoc.exists) {
-      return res.status(404).json({ error: 'Слайд не найден' });
-    }
-    
-    await slideRef.delete();
-    
-    console.log(`Слайд удален: ${req.params.id}`);
-    
+    await db.collection('slides').doc(req.params.id).delete();
     res.json({ success: true });
   } catch (error) {
     console.error('Delete slide error:', error);
-    res.status(500).json({ error: 'Ошибка удаления: ' + error.message });
+    res.status(500).json({ error: 'Ошибка удаления слайда: ' + error.message });
   }
 });
 
 function getMapName(mapId) {
   const maps = {
-    'molen': 'Молендейк',
-    'himmelsdorf': 'Химмельсдорф',
-    'malinovka': 'Малиновка',
-    'prohorovka': 'Прохоровка',
-    'mines': 'Рудники',
-    'castilla': 'Кастилья',
-    'canal': 'Канал',
-    'port': 'Порт',
-    'alpenstadt': 'Альпенштадт',
-    'baltic': 'Балтийский щит',
-    'vino': 'Виноградники',
-    'burningsands': 'Горящие пески',
-    'pyramids': 'Древние пирамиды',
-    'pearlcity': 'Жемчужный город',
-    'pept': 'ПЭПТ',
-    'stadion': 'Стадион',
-    'ice': 'Ледники',
-    'goldvalley': 'Золотая долина',
-    'canyon': 'Каньон',
-    'quarries': 'Карьеры',
-    'lagoon': 'Лагуна',
-    'middleburg': 'Миддлбург',
-    'seaborder': 'Морской рубеж',
-    'normandy': 'Нормандия',
-    'newbay': 'Нью-Бэй',
-    'industrial': 'Промзона',
-    'strait': 'Протока',
-    'faust': 'Фауст',
-    'fort': 'Форт',
-    'hellas': 'Эллада',
-    'elalamein': 'Эль-Аламейн',
-    'echelon': 'Эшелон',
-    'yukon': 'Юкон'
+    'molen': 'Молендейк', 'himmelsdorf': 'Химмельсдорф', 'malinovka': 'Малиновка',
+    'prohorovka': 'Прохоровка', 'mines': 'Рудники', 'castilla': 'Кастилья',
+    'canal': 'Канал', 'port': 'Порт'
   };
-  return maps[mapId] || mapId;
+  return maps[mapId] || mapId || '—';
 }
+
+// Статические файлы
+app.use(express.static(path.join(__dirname, 'public')));
 
 // Основной роут
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
+// Обработка ошибок
+app.use((err, req, res, next) => {
+  console.error('Server error:', err);
+  res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+});
+
 // Запуск сервера
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Сервер запущен на порту ${PORT}`);
-  console.log(`Firebase проект: ${serviceAccount.project_id}`);
-  console.log(`URL: https://jukstats-planner-server.onrender.com`);
-  console.log(`Health check: https://jukstats-planner-server.onrender.com/api/health`);
+  console.log(`🚀 Сервер запущен на порту ${PORT}`);
+  console.log(`📦 Firebase проект: ${serviceAccount.project_id}`);
+  console.log(`🌐 Health check: http://localhost:${PORT}/api/health`);
 });
