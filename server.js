@@ -5,6 +5,7 @@ const helmet = require('helmet');
 const admin = require('firebase-admin');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
+const fs = require('fs');
 
 // Инициализация Firebase
 let serviceAccount;
@@ -60,6 +61,7 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.static(__dirname));
 app.use('/js', express.static(path.join(__dirname, 'js')));
 app.use('/img', express.static(path.join(__dirname, 'img')));
+app.use('/css', express.static(path.join(__dirname, 'css')));
 
 // Логирование API запросов
 app.use('/api', (req, res, next) => {
@@ -67,7 +69,7 @@ app.use('/api', (req, res, next) => {
   next();
 });
 
-// Главная страница - перенаправляем на briefings.html
+// Главная страница
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'briefings.html'));
 });
@@ -227,6 +229,7 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
 
 // ============ BRIEFINGS ROUTES ============
 
+// Создание брифинга
 app.post('/api/briefings', authMiddleware, async (req, res) => {
   try {
     const { title } = req.body;
@@ -245,6 +248,7 @@ app.post('/api/briefings', authMiddleware, async (req, res) => {
     
     await db.collection('briefings').doc(briefingId).set(briefingData);
     
+    // Создаем первый слайд
     const slideId = uuidv4();
     await db.collection('slides').doc(slideId).set({
       id: slideId,
@@ -269,6 +273,7 @@ app.post('/api/briefings', authMiddleware, async (req, res) => {
   }
 });
 
+// Получение списка брифингов
 app.get('/api/briefings', authMiddleware, async (req, res) => {
   try {
     console.log('📋 Fetching briefings for:', req.user.uid);
@@ -286,23 +291,32 @@ app.get('/api/briefings', authMiddleware, async (req, res) => {
       ...doc.data()
     }));
     
-    const slidesPromises = briefings.map(b => 
-      db.collection('slides')
-        .where('briefingId', '==', b.id)
-        .get()
-    );
-    
-    const slidesSnapshots = await Promise.all(slidesPromises);
-    
-    const result = briefings.map((briefing, i) => {
-      const slides = slidesSnapshots[i].docs.map(doc => doc.data());
-      return {
+    const result = [];
+    for (const briefing of briefings) {
+      // Получаем первый слайд
+      const slidesSnapshot = await db.collection('slides')
+        .where('briefingId', '==', briefing.id)
+        .orderBy('order')
+        .limit(1)
+        .get();
+      
+      const firstSlide = slidesSnapshot.docs[0]?.data();
+      
+      // Считаем общее количество слайдов
+      const countSnapshot = await db.collection('slides')
+        .where('briefingId', '==', briefing.id)
+        .count()
+        .get();
+      
+      result.push({
         ...briefing,
-        slideCount: slides.length,
-        firstMap: getMapName(slides[0]?.mapId)
-      };
-    });
+        slideCount: countSnapshot.data().count,
+        firstMap: firstSlide?.mapId || 'molen',
+        firstSlide: firstSlide || null
+      });
+    }
     
+    // Сортируем по дате (новые сначала)
     result.sort((a, b) => {
       const dateA = a.updatedAt?.toDate?.() || new Date(0);
       const dateB = b.updatedAt?.toDate?.() || new Date(0);
@@ -318,6 +332,7 @@ app.get('/api/briefings', authMiddleware, async (req, res) => {
   }
 });
 
+// Получение конкретного брифинга
 app.get('/api/briefings/:id', authMiddleware, async (req, res) => {
   try {
     const briefingDoc = await db.collection('briefings').doc(req.params.id).get();
@@ -328,13 +343,14 @@ app.get('/api/briefings/:id', authMiddleware, async (req, res) => {
     
     const briefing = briefingDoc.data();
     
+    // Получаем все слайды
     const slidesSnapshot = await db.collection('slides')
       .where('briefingId', '==', req.params.id)
+      .orderBy('order')
       .get();
     
     const slides = [];
     slidesSnapshot.forEach(doc => slides.push(doc.data()));
-    slides.sort((a, b) => (a.order || 0) - (b.order || 0));
     
     const isOwner = briefing.ownerId === req.user.uid;
     const isEditor = briefing.editors?.includes(req.user.uid);
@@ -350,6 +366,7 @@ app.get('/api/briefings/:id', authMiddleware, async (req, res) => {
   }
 });
 
+// Обновление брифинга
 app.put('/api/briefings/:id', authMiddleware, async (req, res) => {
   try {
     await db.collection('briefings').doc(req.params.id).update({
@@ -363,6 +380,7 @@ app.put('/api/briefings/:id', authMiddleware, async (req, res) => {
   }
 });
 
+// Удаление брифинга
 app.delete('/api/briefings/:id', authMiddleware, async (req, res) => {
   try {
     const briefingRef = db.collection('briefings').doc(req.params.id);
@@ -372,6 +390,7 @@ app.delete('/api/briefings/:id', authMiddleware, async (req, res) => {
       return res.status(404).json({ error: 'Брифинг не найден' });
     }
     
+    // Удаляем все слайды
     const slidesSnapshot = await db.collection('slides')
       .where('briefingId', '==', req.params.id)
       .get();
@@ -392,10 +411,12 @@ app.delete('/api/briefings/:id', authMiddleware, async (req, res) => {
 
 // ============ SLIDES ROUTES ============
 
+// Создание слайда
 app.post('/api/slides', authMiddleware, async (req, res) => {
   try {
     const { briefingId, name, mapId } = req.body;
     
+    // Получаем текущее количество слайдов для order
     const slidesSnapshot = await db.collection('slides')
       .where('briefingId', '==', briefingId)
       .get();
@@ -419,6 +440,7 @@ app.post('/api/slides', authMiddleware, async (req, res) => {
   }
 });
 
+// Обновление слайда
 app.put('/api/slides/:id', authMiddleware, async (req, res) => {
   try {
     await db.collection('slides').doc(req.params.id).update({
@@ -432,6 +454,7 @@ app.put('/api/slides/:id', authMiddleware, async (req, res) => {
   }
 });
 
+// Удаление слайда
 app.delete('/api/slides/:id', authMiddleware, async (req, res) => {
   try {
     await db.collection('slides').doc(req.params.id).delete();
@@ -442,29 +465,17 @@ app.delete('/api/slides/:id', authMiddleware, async (req, res) => {
   }
 });
 
-function getMapName(mapId) {
-  const maps = {
-    'molen': 'Молендейк', 'himmelsdorf': 'Химмельсдорф', 'malinovka': 'Малиновка',
-    'prohorovka': 'Прохоровка', 'mines': 'Рудники', 'castilla': 'Кастилья',
-    'canal': 'Канал', 'port': 'Порт'
-  };
-  return maps[mapId] || mapId || '—';
-}
-
-// Все остальные запросы - отдаем index.html если есть, иначе briefings.html
+// Все остальные запросы
 app.get('*', (req, res) => {
-  // Не обрабатываем API запросы
   if (req.path.startsWith('/api')) {
     return res.status(404).json({ error: 'API endpoint not found' });
   }
   
-  // Пробуем отдать файл из корня
   const filePath = path.join(__dirname, req.path);
   if (fs.existsSync(filePath)) {
     return res.sendFile(filePath);
   }
   
-  // Если файл не найден, отдаем briefings.html
   res.sendFile(path.join(__dirname, 'briefings.html'));
 });
 
@@ -474,6 +485,7 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Внутренняя ошибка сервера' });
 });
 
+// Запуск сервера
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Сервер запущен на порту ${PORT}`);
