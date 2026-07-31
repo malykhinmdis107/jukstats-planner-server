@@ -1,4 +1,3 @@
-require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -8,165 +7,6 @@ const path = require('path');
 const fs = require('fs');
 const http = require('http');
 const { Server } = require('socket.io');
-
-const server = http.createServer(app);
-const io = new Server(server, {
-    cors: {
-        origin: '*',
-        methods: ['GET', 'POST']
-    }
-});
-
-// ===== WEB SOCKET ДЛЯ REAL-TIME =====
-const rooms = {}; // Хранилище комнат
-
-io.on('connection', (socket) => {
-    console.log('🔌 Новое подключение:', socket.id);
-    
-    // Присоединение к комнате брифинга
-    socket.on('join-room', ({ briefingId, user }) => {
-        socket.join(briefingId);
-        socket.briefingId = briefingId;
-        socket.user = user;
-        
-        // Инициализируем комнату если нужно
-        if (!rooms[briefingId]) {
-            rooms[briefingId] = {
-                users: {},
-                state: null,
-                presenter: null
-            };
-        }
-        
-        // Добавляем пользователя
-        rooms[briefingId].users[socket.id] = {
-            ...user,
-            cursor: { x: 0, y: 0 },
-            lastSeen: Date.now()
-        };
-        
-        // Отправляем текущее состояние комнаты новому пользователю
-        socket.emit('room-state', {
-            users: rooms[briefingId].users,
-            presenter: rooms[briefingId].presenter,
-            state: rooms[briefingId].state
-        });
-        
-        // Уведомляем всех о новом участнике
-        io.to(briefingId).emit('user-joined', {
-            userId: user.id,
-            userName: user.name,
-            users: rooms[briefingId].users
-        });
-        
-        console.log(`👤 ${user.name} присоединился к брифингу ${briefingId}`);
-    });
-    
-    // Обновление позиции курсора
-    socket.on('cursor-move', ({ x, y }) => {
-        if (!socket.briefingId || !rooms[socket.briefingId]) return;
-        
-        const room = rooms[socket.briefingId];
-        if (room.users[socket.id]) {
-            room.users[socket.id].cursor = { x, y };
-            room.users[socket.id].lastSeen = Date.now();
-        }
-        
-        // Отправляем позицию всем кроме отправителя
-        socket.to(socket.briefingId).emit('cursor-update', {
-            userId: socket.user?.id || socket.id,
-            x, y
-        });
-    });
-    
-    // Пинг (жест)
-    socket.on('ping', ({ x, y, color }) => {
-        if (!socket.briefingId) return;
-        socket.to(socket.briefingId).emit('ping-received', {
-            userId: socket.user?.id || socket.id,
-            userName: socket.user?.name || 'Участник',
-            x, y, color
-        });
-    });
-    
-    // Обновление состояния слайда
-    socket.on('slide-update', ({ slide, entities, mapId }) => {
-        if (!socket.briefingId) return;
-        
-        const room = rooms[socket.briefingId];
-        room.state = { slide, entities, mapId };
-        
-        socket.to(socket.briefingId).emit('slide-changed', {
-            slide, entities, mapId,
-            updatedBy: socket.user?.name || 'Участник'
-        });
-    });
-    
-    // Презентация
-    socket.on('present-start', ({ slide }) => {
-        if (!socket.briefingId) return;
-        rooms[socket.briefingId].presenter = socket.user?.id || socket.id;
-        io.to(socket.briefingId).emit('presentation-started', {
-            presenter: socket.user?.name || 'Ведущий',
-            slide
-        });
-    });
-    
-    socket.on('present-stop', () => {
-        if (!socket.briefingId) return;
-        rooms[socket.briefingId].presenter = null;
-        io.to(socket.briefingId).emit('presentation-stopped');
-    });
-    
-    socket.on('present-slide', ({ slide }) => {
-        if (!socket.briefingId) return;
-        socket.to(socket.briefingId).emit('presentation-slide-changed', { slide });
-    });
-    
-    // Отключение
-    socket.on('disconnect', () => {
-        console.log('🔌 Отключение:', socket.id);
-        
-        if (socket.briefingId && rooms[socket.briefingId]) {
-            const room = rooms[socket.briefingId];
-            const userName = room.users[socket.id]?.name || 'Участник';
-            
-            delete room.users[socket.id];
-            
-            // Уведомляем об уходе
-            io.to(socket.briefingId).emit('user-left', {
-                userId: socket.user?.id || socket.id,
-                userName,
-                users: room.users
-            });
-            
-            // Очищаем пустые комнаты
-            if (Object.keys(room.users).length === 0) {
-                setTimeout(() => {
-                    if (Object.keys(room.users).length === 0) {
-                        delete rooms[socket.briefingId];
-                    }
-                }, 60000); // Удаляем через минуту
-            }
-        }
-    });
-    
-    // Очистка неактивных пользователей
-    setInterval(() => {
-        for (const briefingId in rooms) {
-            const room = rooms[briefingId];
-            const now = Date.now();
-            for (const socketId in room.users) {
-                if (now - room.users[socketId].lastSeen > 30000) {
-                    delete room.users[socketId];
-                }
-            }
-            if (Object.keys(room.users).length === 0) {
-                delete rooms[briefingId];
-            }
-        }
-    }, 30000);
-});
 
 // Инициализация Firebase
 let serviceAccount;
@@ -201,6 +41,13 @@ try {
 
 const db = admin.firestore();
 const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST']
+  }
+});
 
 // Middleware
 app.use(helmet({
@@ -390,7 +237,6 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
 
 // ============ BRIEFINGS ROUTES ============
 
-// Создание брифинга
 app.post('/api/briefings', authMiddleware, async (req, res) => {
   try {
     const { title } = req.body;
@@ -409,7 +255,6 @@ app.post('/api/briefings', authMiddleware, async (req, res) => {
     
     await db.collection('briefings').doc(briefingId).set(briefingData);
     
-    // Создаем первый слайд
     const slideId = uuidv4();
     await db.collection('slides').doc(slideId).set({
       id: slideId,
@@ -434,7 +279,6 @@ app.post('/api/briefings', authMiddleware, async (req, res) => {
   }
 });
 
-// Получение списка брифингов
 app.get('/api/briefings', authMiddleware, async (req, res) => {
   try {
     console.log('📋 Fetching briefings for:', req.user.uid);
@@ -454,7 +298,6 @@ app.get('/api/briefings', authMiddleware, async (req, res) => {
     
     const result = [];
     for (const briefing of briefings) {
-      // Получаем первый слайд
       const slidesSnapshot = await db.collection('slides')
         .where('briefingId', '==', briefing.id)
         .orderBy('order')
@@ -463,7 +306,6 @@ app.get('/api/briefings', authMiddleware, async (req, res) => {
       
       const firstSlide = slidesSnapshot.docs[0]?.data();
       
-      // Считаем общее количество слайдов
       const countSnapshot = await db.collection('slides')
         .where('briefingId', '==', briefing.id)
         .count()
@@ -477,7 +319,6 @@ app.get('/api/briefings', authMiddleware, async (req, res) => {
       });
     }
     
-    // Сортируем по дате (новые сначала)
     result.sort((a, b) => {
       const dateA = a.updatedAt?.toDate?.() || new Date(0);
       const dateB = b.updatedAt?.toDate?.() || new Date(0);
@@ -493,7 +334,6 @@ app.get('/api/briefings', authMiddleware, async (req, res) => {
   }
 });
 
-// Получение конкретного брифинга
 app.get('/api/briefings/:id', authMiddleware, async (req, res) => {
   try {
     const briefingDoc = await db.collection('briefings').doc(req.params.id).get();
@@ -504,7 +344,6 @@ app.get('/api/briefings/:id', authMiddleware, async (req, res) => {
     
     const briefing = briefingDoc.data();
     
-    // Получаем все слайды
     const slidesSnapshot = await db.collection('slides')
       .where('briefingId', '==', req.params.id)
       .orderBy('order')
@@ -527,7 +366,6 @@ app.get('/api/briefings/:id', authMiddleware, async (req, res) => {
   }
 });
 
-// Обновление брифинга
 app.put('/api/briefings/:id', authMiddleware, async (req, res) => {
   try {
     await db.collection('briefings').doc(req.params.id).update({
@@ -541,7 +379,6 @@ app.put('/api/briefings/:id', authMiddleware, async (req, res) => {
   }
 });
 
-// Удаление брифинга
 app.delete('/api/briefings/:id', authMiddleware, async (req, res) => {
   try {
     const briefingRef = db.collection('briefings').doc(req.params.id);
@@ -551,7 +388,6 @@ app.delete('/api/briefings/:id', authMiddleware, async (req, res) => {
       return res.status(404).json({ error: 'Брифинг не найден' });
     }
     
-    // Удаляем все слайды
     const slidesSnapshot = await db.collection('slides')
       .where('briefingId', '==', req.params.id)
       .get();
@@ -572,12 +408,10 @@ app.delete('/api/briefings/:id', authMiddleware, async (req, res) => {
 
 // ============ SLIDES ROUTES ============
 
-// Создание слайда
 app.post('/api/slides', authMiddleware, async (req, res) => {
   try {
     const { briefingId, name, mapId } = req.body;
     
-    // Получаем текущее количество слайдов для order
     const slidesSnapshot = await db.collection('slides')
       .where('briefingId', '==', briefingId)
       .get();
@@ -601,7 +435,6 @@ app.post('/api/slides', authMiddleware, async (req, res) => {
   }
 });
 
-// Обновление слайда
 app.put('/api/slides/:id', authMiddleware, async (req, res) => {
   try {
     await db.collection('slides').doc(req.params.id).update({
@@ -615,7 +448,6 @@ app.put('/api/slides/:id', authMiddleware, async (req, res) => {
   }
 });
 
-// Удаление слайда
 app.delete('/api/slides/:id', authMiddleware, async (req, res) => {
   try {
     await db.collection('slides').doc(req.params.id).delete();
@@ -626,30 +458,145 @@ app.delete('/api/slides/:id', authMiddleware, async (req, res) => {
   }
 });
 
+// ============ WEBSOCKET ============
+
+const rooms = {};
+
+io.on('connection', (socket) => {
+  console.log('🔌 Новое подключение:', socket.id);
+  
+  socket.on('join-room', ({ briefingId, user }) => {
+    socket.join(briefingId);
+    socket.briefingId = briefingId;
+    socket.user = user;
+    
+    if (!rooms[briefingId]) {
+      rooms[briefingId] = { users: {}, state: null, presenter: null };
+    }
+    
+    rooms[briefingId].users[socket.id] = {
+      ...user,
+      cursor: { x: 0, y: 0 },
+      lastSeen: Date.now()
+    };
+    
+    socket.emit('room-state', {
+      users: rooms[briefingId].users,
+      presenter: rooms[briefingId].presenter,
+      state: rooms[briefingId].state
+    });
+    
+    io.to(briefingId).emit('user-joined', {
+      userId: user.id,
+      userName: user.name,
+      users: rooms[briefingId].users
+    });
+    
+    console.log(`👤 ${user.name} присоединился к брифингу ${briefingId}`);
+  });
+  
+  socket.on('cursor-move', ({ x, y }) => {
+    if (!socket.briefingId || !rooms[socket.briefingId]) return;
+    const room = rooms[socket.briefingId];
+    if (room.users[socket.id]) {
+      room.users[socket.id].cursor = { x, y };
+      room.users[socket.id].lastSeen = Date.now();
+    }
+    socket.to(socket.briefingId).emit('cursor-update', {
+      userId: socket.user?.id || socket.id,
+      x, y
+    });
+  });
+  
+  socket.on('ping', ({ x, y, color }) => {
+    if (!socket.briefingId) return;
+    socket.to(socket.briefingId).emit('ping-received', {
+      userId: socket.user?.id || socket.id,
+      userName: socket.user?.name || 'Участник',
+      x, y, color
+    });
+  });
+  
+  socket.on('slide-update', ({ slide, entities, mapId }) => {
+    if (!socket.briefingId) return;
+    const room = rooms[socket.briefingId];
+    room.state = { slide, entities, mapId };
+    socket.to(socket.briefingId).emit('slide-changed', {
+      slide, entities, mapId,
+      updatedBy: socket.user?.name || 'Участник'
+    });
+  });
+  
+  socket.on('present-start', ({ slide }) => {
+    if (!socket.briefingId) return;
+    rooms[socket.briefingId].presenter = socket.user?.id || socket.id;
+    io.to(socket.briefingId).emit('presentation-started', {
+      presenter: socket.user?.name || 'Ведущий',
+      slide
+    });
+  });
+  
+  socket.on('present-stop', () => {
+    if (!socket.briefingId) return;
+    rooms[socket.briefingId].presenter = null;
+    io.to(socket.briefingId).emit('presentation-stopped');
+  });
+  
+  socket.on('present-slide', ({ slide }) => {
+    if (!socket.briefingId) return;
+    socket.to(socket.briefingId).emit('presentation-slide-changed', { slide });
+  });
+  
+  socket.on('disconnect', () => {
+    console.log('🔌 Отключение:', socket.id);
+    if (socket.briefingId && rooms[socket.briefingId]) {
+      const room = rooms[socket.briefingId];
+      const userName = room.users[socket.id]?.name || 'Участник';
+      delete room.users[socket.id];
+      io.to(socket.briefingId).emit('user-left', {
+        userId: socket.user?.id || socket.id,
+        userName,
+        users: room.users
+      });
+    }
+  });
+});
+
+setInterval(() => {
+  const now = Date.now();
+  for (const briefingId in rooms) {
+    const room = rooms[briefingId];
+    for (const socketId in room.users) {
+      if (now - room.users[socketId].lastSeen > 30000) {
+        delete room.users[socketId];
+      }
+    }
+    if (Object.keys(room.users).length === 0) {
+      delete rooms[briefingId];
+    }
+  }
+}, 30000);
+
 // Все остальные запросы
 app.get('*', (req, res) => {
   if (req.path.startsWith('/api')) {
     return res.status(404).json({ error: 'API endpoint not found' });
   }
-  
   const filePath = path.join(__dirname, req.path);
   if (fs.existsSync(filePath)) {
     return res.sendFile(filePath);
   }
-  
   res.sendFile(path.join(__dirname, 'briefings.html'));
 });
 
-// Обработка ошибок
 app.use((err, req, res, next) => {
   console.error('❌ Server error:', err);
   res.status(500).json({ error: 'Внутренняя ошибка сервера' });
 });
 
-// Запуск сервера
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`🚀 Сервер запущен на порту ${PORT}`);
-    console.log(`📦 Firebase проект: ${serviceAccount.project_id}`);
-    console.log(`🔌 WebSocket готов`);
+  console.log(`🚀 Сервер запущен на порту ${PORT}`);
+  console.log(`📦 Firebase проект: ${serviceAccount.project_id}`);
+  console.log(`🔌 WebSocket готов`);
 });
