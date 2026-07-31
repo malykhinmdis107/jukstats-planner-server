@@ -7,6 +7,176 @@ const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const fs = require('fs');
 
+// В начало server.js добавьте:
+const http = require('http');
+const { Server } = require('socket.io');
+
+const server = http.createServer(app);
+const io = new Server(server, {
+    cors: {
+        origin: '*',
+        methods: ['GET', 'POST']
+    }
+});
+
+// Замените app.listen на:
+server.listen(PORT, () => {
+    console.log(`🚀 Сервер запущен на порту ${PORT}`);
+    console.log(`📦 Firebase проект: ${serviceAccount.project_id}`);
+    console.log(`🔌 WebSocket готов`);
+});
+
+// ===== WEB SOCKET ДЛЯ REAL-TIME =====
+const rooms = {}; // Хранилище комнат
+
+io.on('connection', (socket) => {
+    console.log('🔌 Новое подключение:', socket.id);
+    
+    // Присоединение к комнате брифинга
+    socket.on('join-room', ({ briefingId, user }) => {
+        socket.join(briefingId);
+        socket.briefingId = briefingId;
+        socket.user = user;
+        
+        // Инициализируем комнату если нужно
+        if (!rooms[briefingId]) {
+            rooms[briefingId] = {
+                users: {},
+                state: null,
+                presenter: null
+            };
+        }
+        
+        // Добавляем пользователя
+        rooms[briefingId].users[socket.id] = {
+            ...user,
+            cursor: { x: 0, y: 0 },
+            lastSeen: Date.now()
+        };
+        
+        // Отправляем текущее состояние комнаты новому пользователю
+        socket.emit('room-state', {
+            users: rooms[briefingId].users,
+            presenter: rooms[briefingId].presenter,
+            state: rooms[briefingId].state
+        });
+        
+        // Уведомляем всех о новом участнике
+        io.to(briefingId).emit('user-joined', {
+            userId: user.id,
+            userName: user.name,
+            users: rooms[briefingId].users
+        });
+        
+        console.log(`👤 ${user.name} присоединился к брифингу ${briefingId}`);
+    });
+    
+    // Обновление позиции курсора
+    socket.on('cursor-move', ({ x, y }) => {
+        if (!socket.briefingId || !rooms[socket.briefingId]) return;
+        
+        const room = rooms[socket.briefingId];
+        if (room.users[socket.id]) {
+            room.users[socket.id].cursor = { x, y };
+            room.users[socket.id].lastSeen = Date.now();
+        }
+        
+        // Отправляем позицию всем кроме отправителя
+        socket.to(socket.briefingId).emit('cursor-update', {
+            userId: socket.user?.id || socket.id,
+            x, y
+        });
+    });
+    
+    // Пинг (жест)
+    socket.on('ping', ({ x, y, color }) => {
+        if (!socket.briefingId) return;
+        socket.to(socket.briefingId).emit('ping-received', {
+            userId: socket.user?.id || socket.id,
+            userName: socket.user?.name || 'Участник',
+            x, y, color
+        });
+    });
+    
+    // Обновление состояния слайда
+    socket.on('slide-update', ({ slide, entities, mapId }) => {
+        if (!socket.briefingId) return;
+        
+        const room = rooms[socket.briefingId];
+        room.state = { slide, entities, mapId };
+        
+        socket.to(socket.briefingId).emit('slide-changed', {
+            slide, entities, mapId,
+            updatedBy: socket.user?.name || 'Участник'
+        });
+    });
+    
+    // Презентация
+    socket.on('present-start', ({ slide }) => {
+        if (!socket.briefingId) return;
+        rooms[socket.briefingId].presenter = socket.user?.id || socket.id;
+        io.to(socket.briefingId).emit('presentation-started', {
+            presenter: socket.user?.name || 'Ведущий',
+            slide
+        });
+    });
+    
+    socket.on('present-stop', () => {
+        if (!socket.briefingId) return;
+        rooms[socket.briefingId].presenter = null;
+        io.to(socket.briefingId).emit('presentation-stopped');
+    });
+    
+    socket.on('present-slide', ({ slide }) => {
+        if (!socket.briefingId) return;
+        socket.to(socket.briefingId).emit('presentation-slide-changed', { slide });
+    });
+    
+    // Отключение
+    socket.on('disconnect', () => {
+        console.log('🔌 Отключение:', socket.id);
+        
+        if (socket.briefingId && rooms[socket.briefingId]) {
+            const room = rooms[socket.briefingId];
+            const userName = room.users[socket.id]?.name || 'Участник';
+            
+            delete room.users[socket.id];
+            
+            // Уведомляем об уходе
+            io.to(socket.briefingId).emit('user-left', {
+                userId: socket.user?.id || socket.id,
+                userName,
+                users: room.users
+            });
+            
+            // Очищаем пустые комнаты
+            if (Object.keys(room.users).length === 0) {
+                setTimeout(() => {
+                    if (Object.keys(room.users).length === 0) {
+                        delete rooms[socket.briefingId];
+                    }
+                }, 60000); // Удаляем через минуту
+            }
+        }
+    });
+    
+    // Очистка неактивных пользователей
+    setInterval(() => {
+        for (const briefingId in rooms) {
+            const room = rooms[briefingId];
+            const now = Date.now();
+            for (const socketId in room.users) {
+                if (now - room.users[socketId].lastSeen > 30000) {
+                    delete room.users[socketId];
+                }
+            }
+            if (Object.keys(room.users).length === 0) {
+                delete rooms[briefingId];
+            }
+        }
+    }, 30000);
+});
+
 // Инициализация Firebase
 let serviceAccount;
 try {
