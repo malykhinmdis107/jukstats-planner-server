@@ -1,47 +1,16 @@
-require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const http = require('http');
-const admin = require('firebase-admin');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
+const fs = require('fs');
+const WebSocket = require('ws');
 
 const app = express();
 const server = http.createServer(app);
 
-const { Server } = require('socket.io');
-
-// После создания server:
-const io = new Server(server, {
-    cors: {
-        origin: '*',
-        methods: ['GET', 'POST']
-    }
-});
-
-io.on('connection', (socket) => {
-    console.log('🔌 Client connected:', socket.id);
-    
-    // Присоединение к комнате брифинга
-    socket.on('join', (briefingId) => {
-        socket.join(briefingId);
-        console.log(`👤 ${socket.id} joined room ${briefingId}`);
-    });
-    
-    // Синхронизация состояния
-    socket.on('state', (data) => {
-        socket.to(data.briefingId).emit('state', data);
-    });
-    
-    // Курсор
-    socket.on('cursor', (data) => {
-        socket.to(data.briefingId).emit('cursor', data);
-    });
-    
-    socket.on('disconnect', () => {
-        console.log('🔌 Client disconnected:', socket.id);
-    });
-});
+// WebSocket сервер
+const wss = new WebSocket.Server({ server });
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
@@ -49,6 +18,7 @@ app.use(express.json({ limit: '10mb' }));
 // Firebase
 let db = null;
 try {
+  const admin = require('firebase-admin');
   const serviceAccount = require('/etc/secrets/serviceAccountKey.json');
   admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
   db = admin.firestore();
@@ -57,134 +27,114 @@ try {
   console.error('Firebase error:', e.message);
 }
 
-// ===== СТАТИЧЕСКИЕ ФАЙЛЫ (если есть) =====
+// Статические файлы
 app.use(express.static(__dirname));
 app.use('/js', express.static(path.join(__dirname, 'js')));
 app.use('/css', express.static(path.join(__dirname, 'css')));
 app.use('/img', express.static(path.join(__dirname, 'img')));
 
-// ===== ГЛАВНАЯ СТРАНИЦА =====
+// Главная
 app.get('/', (req, res) => {
-  // Пробуем отдать briefings.html, если нет - отдаём planner.html, если и его нет - JSON
-  const fs = require('fs');
-  const briefingsPath = path.join(__dirname, 'briefings.html');
-  const plannerPath = path.join(__dirname, 'planner.html');
-  
-  if (fs.existsSync(briefingsPath)) {
-    res.sendFile(briefingsPath);
-  } else if (fs.existsSync(plannerPath)) {
-    res.sendFile(plannerPath);
-  } else {
-    res.json({ 
-      status: 'planner-api',
-      message: 'No static files found. API is working.',
-      endpoints: ['/api/health', '/api/auth/lesta', '/api/auth/guest', '/api/briefings', '/api/slides']
-    });
-  }
+  const p = path.join(__dirname, 'briefings.html');
+  if (fs.existsSync(p)) res.sendFile(p);
+  else res.json({ status: 'ok' });
 });
 
-// Health check
+// Health
 app.get('/api/health', (req, res) => {
-  const fs = require('fs');
-  res.json({ 
-    status: 'ok', 
-    db: !!db,
-    timestamp: new Date().toISOString(),
-    files: fs.existsSync(path.join(__dirname, 'briefings.html')) ? 'briefings.html found' : 'no briefings.html',
-    uptime: process.uptime()
+  res.json({ status: 'ok', db: !!db, uptime: process.uptime() });
+});
+
+// ===== WEBSOCKET =====
+const rooms = new Map(); // roomId -> Set of WebSocket
+
+wss.on('connection', (ws, req) => {
+  const url = new URL(req.url, 'http://localhost');
+  const briefingId = url.searchParams.get('room') || 'default';
+  
+  if (!rooms.has(briefingId)) rooms.set(briefingId, new Set());
+  rooms.get(briefingId).add(ws);
+  
+  console.log(`🔌 Connected to room ${briefingId}. Total: ${rooms.get(briefingId).size}`);
+  
+  // Отправляем текущее количество участников
+  broadcast(briefingId, { type: 'users_count', count: rooms.get(briefingId).size });
+  
+  ws.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data);
+      // Пересылаем всем в комнате кроме отправителя
+      rooms.get(briefingId)?.forEach(client => {
+        if (client !== ws && client.readyState === WebSocket.OPEN) {
+          client.send(JSON.stringify(msg));
+        }
+      });
+    } catch(e) {}
+  });
+  
+  ws.on('close', () => {
+    rooms.get(briefingId)?.delete(ws);
+    if (rooms.get(briefingId)?.size === 0) rooms.delete(briefingId);
+    broadcast(briefingId, { type: 'users_count', count: rooms.get(briefingId)?.size || 0 });
+    console.log(`🔌 Disconnected from room ${briefingId}`);
   });
 });
 
-// ===== AUTH ROUTES =====
+function broadcast(roomId, data) {
+  const room = rooms.get(roomId);
+  if (room) {
+    const msg = JSON.stringify(data);
+    room.forEach(client => {
+      if (client.readyState === WebSocket.OPEN) client.send(msg);
+    });
+  }
+}
 
+// ===== AUTH =====
 app.post('/api/auth/lesta', async (req, res) => {
-  if (!db) return res.status(500).json({ error: 'Database not available' });
+  if (!db) return res.status(500).json({ error: 'No database' });
   try {
-    console.log('📝 Lesta auth:', { accountId: req.body.accountId, nickname: req.body.nickname });
     const { accessToken, accountId, nickname } = req.body;
+    if (!accountId) return res.status(400).json({ error: 'No accountId' });
     
-    if (!accessToken || !accountId) {
-      return res.status(400).json({ error: 'Неверные данные' });
-    }
-
-    const firebaseUid = `lesta_${accountId}`;
-    const userRef = db.collection('users').doc(firebaseUid);
-    const userDoc = await userRef.get();
+    const uid = `lesta_${accountId}`;
+    const ref = db.collection('users').doc(uid);
+    const doc = await ref.get();
     
-    if (!userDoc.exists) {
-      await userRef.set({
-        uid: firebaseUid,
-        lestaId: accountId,
-        name: nickname || 'Игрок',
-        isGuest: false,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        lastLogin: admin.firestore.FieldValue.serverTimestamp()
+    if (!doc.exists) {
+      await ref.set({
+        uid, lestaId: accountId, name: nickname || 'Игрок',
+        isGuest: false, createdAt: new Date().toISOString(), lastLogin: new Date().toISOString()
       });
     } else {
-      await userRef.update({
-        name: nickname || userDoc.data().name,
-        lastLogin: admin.firestore.FieldValue.serverTimestamp()
-      });
+      await ref.update({ name: nickname || doc.data().name, lastLogin: new Date().toISOString() });
     }
-
-    console.log('✅ Lesta auth success:', firebaseUid);
     
-    res.json({
-      token: firebaseUid,
-      user: {
-        id: firebaseUid,
-        name: nickname || 'Игрок',
-        lestaId: accountId,
-        isGuest: false
-      }
-    });
-  } catch (error) {
-    console.error('❌ Lesta auth error:', error);
-    res.status(500).json({ error: 'Ошибка авторизации: ' + error.message });
-  }
+    res.json({ token: uid, user: { id: uid, name: nickname || 'Игрок', lestaId: accountId, isGuest: false } });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/auth/guest', async (req, res) => {
-  if (!db) return res.status(500).json({ error: 'Database not available' });
+  if (!db) return res.status(500).json({ error: 'No database' });
   try {
     const { guestId, name } = req.body;
+    if (!guestId) return res.status(400).json({ error: 'No guestId' });
     
-    if (!guestId) {
-      return res.status(400).json({ error: 'Требуется ID гостя' });
-    }
-
-    const firebaseUid = `guest_${guestId}`;
-    const userRef = db.collection('users').doc(firebaseUid);
-    const userDoc = await userRef.get();
+    const uid = `guest_${guestId}`;
+    const ref = db.collection('users').doc(uid);
+    const doc = await ref.get();
     
-    if (!userDoc.exists) {
-      await userRef.set({
-        uid: firebaseUid,
-        guestId,
-        name: name || 'Гость',
-        isGuest: true,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        lastLogin: admin.firestore.FieldValue.serverTimestamp()
+    if (!doc.exists) {
+      await ref.set({
+        uid, guestId, name: name || 'Гость',
+        isGuest: true, createdAt: new Date().toISOString(), lastLogin: new Date().toISOString()
       });
     } else {
-      await userRef.update({
-        lastLogin: admin.firestore.FieldValue.serverTimestamp()
-      });
+      await ref.update({ lastLogin: new Date().toISOString() });
     }
-
-    res.json({
-      token: firebaseUid,
-      user: {
-        id: firebaseUid,
-        name: name || 'Гость',
-        isGuest: true,
-        guestId
-      }
-    });
-  } catch (error) {
-    console.error('❌ Guest auth error:', error);
-    res.status(500).json({ error: 'Ошибка авторизации: ' + error.message });
-  }
+    
+    res.json({ token: uid, user: { id: uid, name: name || 'Гость', isGuest: true } });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/auth/me', async (req, res) => {
@@ -192,263 +142,130 @@ app.get('/api/auth/me', async (req, res) => {
   try {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) return res.json({ user: { id: 'guest', name: 'Гость', isGuest: true } });
-    
-    const userDoc = await db.collection('users').doc(token).get();
-    res.json({ 
-      user: userDoc.exists ? userDoc.data() : { id: token, name: 'Гость', isGuest: true }
-    });
-  } catch (error) {
-    res.json({ user: { id: 'guest', name: 'Гость', isGuest: true } });
-  }
+    const doc = await db.collection('users').doc(token).get();
+    res.json({ user: doc.exists ? doc.data() : { id: token, name: 'Гость', isGuest: true } });
+  } catch(e) { res.json({ user: { id: 'guest', name: 'Гость', isGuest: true } }); }
 });
 
-// ===== BRIEFINGS ROUTES =====
-
+// ===== BRIEFINGS =====
 app.post('/api/briefings', async (req, res) => {
-  if (!db) return res.status(500).json({ error: 'Database not available' });
+  if (!db) return res.status(500).json({ error: 'No database' });
   try {
     const token = req.headers.authorization?.split(' ')[1] || 'guest';
-    const { title } = req.body;
-    const briefingId = uuidv4();
+    const id = uuidv4();
     
-    const briefingData = {
-      id: briefingId,
-      title: title || 'Безымянный брифинг',
-      ownerId: token,
-      editors: [],
-      viewers: [],
-      notes: '',
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
-    };
-    
-    await db.collection('briefings').doc(briefingId).set(briefingData);
+    await db.collection('briefings').doc(id).set({
+      id, title: req.body.title || 'Безымянный', ownerId: token,
+      editors: [], viewers: [], notes: '',
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+    });
     
     const slideId = uuidv4();
     await db.collection('slides').doc(slideId).set({
-      id: slideId,
-      briefingId: briefingId,
-      name: 'Этап 1',
-      mapId: 'molen',
-      entities: [],
-      order: 0,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      id: slideId, briefingId: id, name: 'Этап 1', mapId: 'molen',
+      entities: [], order: 0,
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
     });
     
-    console.log('✅ Created briefing:', briefingId);
-    
-    res.json({
-      briefing: briefingData,
-      firstSlideId: slideId
-    });
-  } catch (error) {
-    console.error('❌ Create briefing error:', error);
-    res.status(500).json({ error: 'Ошибка создания брифинга: ' + error.message });
-  }
+    res.json({ briefing: { id, title: req.body.title }, firstSlideId: slideId });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/briefings', async (req, res) => {
   if (!db) return res.json({ briefings: [] });
   try {
     const token = req.headers.authorization?.split(' ')[1] || 'guest';
-    console.log('📋 Fetching briefings for:', token);
-    
-    const briefingsSnapshot = await db.collection('briefings')
-      .where('ownerId', '==', token)
-      .get();
-    
-    if (briefingsSnapshot.empty) {
-      return res.json({ briefings: [] });
-    }
-    
-    const briefings = briefingsSnapshot.docs.map(doc => ({
-      id: doc.id,
-      ...doc.data()
-    }));
-    
-    const result = [];
-    for (const briefing of briefings) {
-      const slidesSnapshot = await db.collection('slides')
-        .where('briefingId', '==', briefing.id)
-        .orderBy('order')
-        .limit(1)
-        .get();
-      
-      const firstSlide = slidesSnapshot.docs[0]?.data();
-      const slideCount = (await db.collection('slides')
-        .where('briefingId', '==', briefing.id)
-        .count()
-        .get()).data().count;
-      
-      result.push({
-        ...briefing,
-        slideCount,
-        firstMap: firstSlide?.mapId || 'molen',
-        firstSlide: firstSlide || null
-      });
-    }
-    
-    result.sort((a, b) => {
-      const dateA = a.updatedAt?.toDate?.() || new Date(0);
-      const dateB = b.updatedAt?.toDate?.() || new Date(0);
-      return dateB - dateA;
-    });
-    
-    res.json({ briefings: result });
-  } catch (error) {
-    console.error('❌ Get briefings error:', error);
-    res.json({ briefings: [] });
-  }
+    const snap = await db.collection('briefings').where('ownerId', '==', token).get();
+    const briefings = [];
+    snap.forEach(d => briefings.push(d.data()));
+    briefings.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+    res.json({ briefings });
+  } catch(e) { res.json({ briefings: [] }); }
 });
 
 app.get('/api/briefings/:id', async (req, res) => {
-  if (!db) return res.status(404).json({ error: 'Database not available' });
+  if (!db) return res.status(404).json({ error: 'No database' });
   try {
-    const briefingDoc = await db.collection('briefings').doc(req.params.id).get();
+    const doc = await db.collection('briefings').doc(req.params.id).get();
+    if (!doc.exists) return res.status(404).json({ error: 'Not found' });
     
-    if (!briefingDoc.exists) {
-      return res.status(404).json({ error: 'Брифинг не найден' });
-    }
-    
-    const briefing = briefingDoc.data();
-    
-    const slidesSnapshot = await db.collection('slides')
-      .where('briefingId', '==', req.params.id)
-      .orderBy('order')
-      .get();
-    
+    const briefing = doc.data();
+    const slidesSnap = await db.collection('slides').where('briefingId', '==', req.params.id).orderBy('order').get();
     const slides = [];
-    slidesSnapshot.forEach(doc => slides.push(doc.data()));
+    slidesSnap.forEach(d => slides.push(d.data()));
     
     const token = req.headers.authorization?.split(' ')[1] || 'guest';
-    const isOwner = briefing.ownerId === token;
-    const isEditor = briefing.editors?.includes(token);
-    
     res.json({
       briefing,
       slides,
-      myRole: isOwner ? 'owner' : isEditor ? 'editor' : 'viewer'
+      myRole: briefing.ownerId === token ? 'owner' : briefing.editors?.includes(token) ? 'editor' : 'viewer'
     });
-  } catch (error) {
-    res.status(500).json({ error: 'Ошибка: ' + error.message });
-  }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.put('/api/briefings/:id', async (req, res) => {
-  if (!db) return res.status(500).json({ error: 'Database not available' });
+  if (!db) return res.status(500).json({ error: 'No database' });
   try {
     await db.collection('briefings').doc(req.params.id).update({
-      ...req.body,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      ...req.body, updatedAt: new Date().toISOString()
     });
+    
+    // Оповещаем всех в комнате об изменении
+    broadcast(req.params.id, { type: 'briefing_updated', id: req.params.id, data: req.body });
+    
     res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: 'Ошибка: ' + error.message });
-  }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.delete('/api/briefings/:id', async (req, res) => {
-  if (!db) return res.status(500).json({ error: 'Database not available' });
+  if (!db) return res.status(500).json({ error: 'No database' });
   try {
-    const slidesSnapshot = await db.collection('slides')
-      .where('briefingId', '==', req.params.id)
-      .get();
-    
+    const slidesSnap = await db.collection('slides').where('briefingId', '==', req.params.id).get();
     const batch = db.batch();
-    slidesSnapshot.docs.forEach(doc => batch.delete(doc.ref));
+    slidesSnap.forEach(d => batch.delete(d.ref));
     batch.delete(db.collection('briefings').doc(req.params.id));
     await batch.commit();
-    
     res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: 'Ошибка: ' + error.message });
-  }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ===== SLIDES ROUTES =====
-
+// ===== SLIDES =====
 app.post('/api/slides', async (req, res) => {
-  if (!db) return res.status(500).json({ error: 'Database not available' });
+  if (!db) return res.status(500).json({ error: 'No database' });
   try {
     const { briefingId, name, mapId } = req.body;
-    
-    const slidesSnapshot = await db.collection('slides')
-      .where('briefingId', '==', briefingId)
-      .get();
-    
-    const slideId = uuidv4();
-    await db.collection('slides').doc(slideId).set({
-      id: slideId,
-      briefingId,
-      name: name || 'Этап',
-      mapId: mapId || 'molen',
-      entities: [],
-      order: slidesSnapshot.size,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    const id = uuidv4();
+    await db.collection('slides').doc(id).set({
+      id, briefingId, name: name || 'Этап', mapId: mapId || 'molen',
+      entities: [], order: 0,
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
     });
-    
-    res.json({ slide: { id: slideId, briefingId, name, mapId } });
-  } catch (error) {
-    res.status(500).json({ error: 'Ошибка: ' + error.message });
-  }
+    res.json({ slide: { id } });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.put('/api/slides/:id', async (req, res) => {
-  if (!db) return res.status(500).json({ error: 'Database not available' });
+  if (!db) return res.status(500).json({ error: 'No database' });
   try {
     await db.collection('slides').doc(req.params.id).update({
-      ...req.body,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      ...req.body, updatedAt: new Date().toISOString()
     });
-    res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: 'Ошибка: ' + error.message });
-  }
-});
-
-app.delete('/api/slides/:id', async (req, res) => {
-  if (!db) return res.status(500).json({ error: 'Database not available' });
-  try {
-    await db.collection('slides').doc(req.params.id).delete();
-    res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: 'Ошибка: ' + error.message });
-  }
-});
-
-// ===== ОЧИСТКА СТАРЫХ ГОСТЕЙ =====
-setInterval(async () => {
-  if (!db) return;
-  try {
-    const oldDate = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const snapshot = await db.collection('users')
-      .where('isGuest', '==', true)
-      .where('lastLogin', '<', oldDate)
-      .get();
     
-    if (snapshot.size > 0) {
-      const batch = db.batch();
-      snapshot.docs.forEach(doc => batch.delete(doc.ref));
-      await batch.commit();
-      console.log(`🧹 Cleaned ${snapshot.size} old guest accounts`);
+    // Получаем briefingId и оповещаем комнату
+    const slide = await db.collection('slides').doc(req.params.id).get();
+    if (slide.exists) {
+      broadcast(slide.data().briefingId, { type: 'slide_updated', slideId: req.params.id, data: req.body });
     }
-  } catch (e) {
-    console.error('Cleanup error:', e);
-  }
-}, 3600000);
+    
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
 
 // Keep-alive
 setInterval(() => {
   const url = process.env.RENDER_EXTERNAL_URL;
-  if (url) {
-    require('https').get(url + '/api/health', () => {}).on('error', () => {});
-  }
+  if (url) require('https').get(url + '/api/health', () => {}).on('error', () => {});
 }, 10 * 60 * 1000);
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`✅ PLANNER:${PORT}`);
-  console.log(`📁 Static files from: ${__dirname}`);
-});
+server.listen(PORT, '0.0.0.0', () => console.log(`✅ PLANNER:${PORT}`));
