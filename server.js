@@ -8,6 +8,41 @@ const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
+
+const { Server } = require('socket.io');
+
+// После создания server:
+const io = new Server(server, {
+    cors: {
+        origin: '*',
+        methods: ['GET', 'POST']
+    }
+});
+
+io.on('connection', (socket) => {
+    console.log('🔌 Client connected:', socket.id);
+    
+    // Присоединение к комнате брифинга
+    socket.on('join', (briefingId) => {
+        socket.join(briefingId);
+        console.log(`👤 ${socket.id} joined room ${briefingId}`);
+    });
+    
+    // Синхронизация состояния
+    socket.on('state', (data) => {
+        socket.to(data.briefingId).emit('state', data);
+    });
+    
+    // Курсор
+    socket.on('cursor', (data) => {
+        socket.to(data.briefingId).emit('cursor', data);
+    });
+    
+    socket.on('disconnect', () => {
+        console.log('🔌 Client disconnected:', socket.id);
+    });
+});
+
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
